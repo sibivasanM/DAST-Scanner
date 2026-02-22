@@ -1,0 +1,69 @@
+services:
+  # ── ZAP Daemon ──────────────────────────────────────────────────────────────
+  zap:
+    container_name: vulnerability-scanner-zap
+    image: ghcr.io/zaproxy/zaproxy:stable
+    command: >
+      zap.sh -daemon -host 0.0.0.0 -port 8080
+      -config api.key=vulnforge-zap-key
+      -config api.addrs.addr.name=.*
+      -config api.addrs.addr.regex=true
+      -config api.disablekey=false
+      -config connection.timeoutInSecs=120
+      -config spider.maxDuration=5
+      -config scanner.maxScanDurationInMins=60
+    ports:
+      - "8080:8080"
+    volumes:
+      - zap-data:/zap/wrk
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/JSON/core/view/version/?apikey=vulnforge-zap-key"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Backend API ─────────────────────────────────────────────────────────────
+  backend:
+    container_name: vulnerability-scanner-backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - ZAP_API_URL=http://zap:8080
+      - ZAP_API_KEY=vulnforge-zap-key
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - scan-data:/app/data
+      - screenshots:/app/screenshots
+    depends_on:
+      zap:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Frontend ────────────────────────────────────────────────────────────────
+  frontend:
+    container_name: vulnerability-scanner-frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  scan-data:
+  screenshots:
+  zap-data:
