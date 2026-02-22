@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from modules.database import Database
@@ -24,6 +25,7 @@ from modules.zap_scanner import ZapScanner
 from modules.dedup import DeduplicationEngine
 from modules.ai_analyzer import AIAnalyzer
 from modules.poc_generator import PoCGenerator
+from modules.pdf_report import PDFReportGenerator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("vulnforge")
@@ -78,6 +80,7 @@ zap_scanner = ZapScanner()
 dedup = DeduplicationEngine()
 ai_analyzer = AIAnalyzer()
 poc_gen = PoCGenerator()
+pdf_generator = PDFReportGenerator()
 
 
 @asynccontextmanager
@@ -200,14 +203,28 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
             for i, finding in enumerate(unique_findings):
                 try:
                     poc_result = await poc_gen.generate(finding)
+                    
+                    # Generate steps to reproduce
+                    steps_result = await poc_gen.generate_steps_to_reproduce(finding)
+                    
                     db.update_finding(
                         finding["id"],
                         poc_script=poc_result.get("script", ""),
                         poc_screenshot=poc_result.get("screenshot_path", ""),
                         poc_evidence=json.dumps(poc_result.get("evidence", {})),
                     )
+                    
+                    # Store steps to reproduce if generated
+                    if steps_result.get("steps"):
+                        db.update_finding(
+                            finding["id"],
+                            extracted_results=json.dumps({
+                                "steps_to_reproduce": steps_result
+                            })
+                        )
                 except Exception as e:
                     db.update_finding(finding["id"], poc_script=f"# PoC failed: {e}")
+                    logger.error(f"[{scan_id}] PoC generation failed for {finding.get('id')}: {e}")
 
         # ── Done ──────────────────────────────────────────────────────────────
         db.update_scan(scan_id, status="completed", phase="done",
@@ -302,3 +319,85 @@ async def health():
         "ai_enabled": ai_analyzer.enabled,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ── Report Generation ────────────────────────────────────────────────────────
+
+@app.get("/api/scans/{scan_id}/report/pdf")
+async def export_scan_pdf(scan_id: str):
+    """Generate and download a PDF report for a specific scan."""
+    scan = db.get_scan(scan_id)
+    if not scan:
+        raise HTTPException(404, "Scan not found")
+
+    findings = db.get_findings(scan_id=scan_id)
+    if not findings:
+        findings = []
+
+    # Convert scan row to dict
+    scan_dict = dict(scan)
+
+    # Generate PDF
+    try:
+        pdf_buffer = pdf_generator.generate_report(
+            scan=scan_dict,
+            findings=findings,
+            report_title=f"Vulnerability Scan Report — {scan_dict.get('target', 'Unknown')}",
+        )
+
+        # Return as streaming response
+        return StreamingResponse(
+            iter([pdf_buffer.getvalue()]),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="report_{scan_id}.pdf"'
+            },
+        )
+    except Exception as e:
+        logger.error(f"[PDF] Report generation failed: {e}")
+        raise HTTPException(500, f"Failed to generate report: {str(e)}")
+
+
+@app.get("/api/scans/report/bulk-pdf")
+async def export_bulk_pdf(target: Optional[str] = None, status: Optional[str] = None):
+    """Generate PDF reports for multiple scans grouped by target."""
+    scans = db.get_scans(limit=1000)
+    if not scans:
+        raise HTTPException(404, "No scans found")
+
+    # Group by target
+    grouped = {}
+    for scan in scans:
+        target_url = scan.get("target", "unknown")
+        if target_url not in grouped:
+            grouped[target_url] = []
+        grouped[target_url].append(dict(scan))
+
+    # For now, generate the first target's report
+    if grouped:
+        target_scans = list(grouped.values())[0]
+        scan_dict = target_scans[0]
+
+        findings = db.get_findings(scan_id=scan_dict["scan_id"])
+        if not findings:
+            findings = []
+
+        try:
+            pdf_buffer = pdf_generator.generate_report(
+                scan=scan_dict,
+                findings=findings,
+                report_title=f"Vulnerability Scan Report — {scan_dict.get('target', 'Unknown')}",
+            )
+
+            return StreamingResponse(
+                iter([pdf_buffer.getvalue()]),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'attachment; filename="report_{scan_dict.get("target", "scan").replace("/", "_").replace(":", "")}.pdf"'
+                },
+            )
+        except Exception as e:
+            logger.error(f"[PDF] Bulk report generation failed: {e}")
+            raise HTTPException(500, f"Failed to generate report: {str(e)}")
+
+    raise HTTPException(404, "No reports could be generated")

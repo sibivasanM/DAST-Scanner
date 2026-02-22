@@ -27,11 +27,13 @@ class DeduplicationEngine:
     def deduplicate(self, findings: list[dict], scan_id: str) -> list[dict]:
         """
         Remove duplicate findings using multi-level deduplication.
+        Also groups similar findings under a parent finding.
 
-        Returns only unique findings not seen in this scan or previous scans.
+        Returns unique findings with grouped instances consolidated.
         """
         unique = []
         scan_hashes = set()
+        findings_by_fuzzy = {}  # Group by fuzzy hash for consolidation
 
         for finding in findings:
             # Level 1: Exact match within this scan
@@ -40,33 +42,112 @@ class DeduplicationEngine:
                 logger.debug(f"Dedup L1 (exact): {finding.get('name')}")
                 continue
 
-            # Level 2: Fuzzy match (normalized URL)
+            # Level 2: Fuzzy match (normalized URL) - for grouping
             fuzzy_hash = self._fuzzy_hash(finding)
-            if fuzzy_hash in scan_hashes:
-                logger.debug(f"Dedup L2 (fuzzy): {finding.get('name')}")
-                continue
+            if fuzzy_hash not in findings_by_fuzzy:
+                findings_by_fuzzy[fuzzy_hash] = []
+            findings_by_fuzzy[fuzzy_hash].append(finding)
 
             # Level 3: Cross-scan dedup
             cross_hash = self._cross_scan_hash(finding)
             if cross_hash in self._cross_scan_hashes:
                 logger.debug(f"Dedup L3 (cross-scan): {finding.get('name')}")
+                # Still add to fuzzy grouping for consolidation
                 continue
 
-            # New unique finding
-            finding["dedup_hash"] = exact_hash
+            # Mark as seen
             scan_hashes.add(exact_hash)
             scan_hashes.add(fuzzy_hash)
             self._cross_scan_hashes.add(cross_hash)
-            unique.append(finding)
+        
+        # Now consolidate grouped findings
+        processed_fuzzy_hashes = set()
+        for fuzzy_hash, similar_findings in findings_by_fuzzy.items():
+            if fuzzy_hash in processed_fuzzy_hashes:
+                continue
+            
+            if len(similar_findings) > 1:
+                # Group these similar findings under one parent finding
+                parent = self._consolidate_findings(similar_findings)
+                unique.append(parent)
+                processed_fuzzy_hashes.add(fuzzy_hash)
+            elif len(similar_findings) == 1 and fuzzy_hash not in self._cross_scan_hashes:
+                # Single finding in group
+                finding = similar_findings[0]
+                finding["dedup_hash"] = self._exact_hash(finding)
+                unique.append(finding)
+                processed_fuzzy_hashes.add(fuzzy_hash)
 
         deduped = len(findings) - len(unique)
         if deduped > 0:
             logger.info(
                 f"Deduplicated {deduped}/{len(findings)} findings "
-                f"({len(unique)} unique)"
+                f"({len(unique)} unique/grouped)"
             )
 
         return unique
+
+    def _consolidate_findings(self, similar_findings: list[dict]) -> dict:
+        """
+        Consolidate multiple similar findings into one grouped finding.
+        Stores all URLs, payloads, and steps together.
+        """
+        if not similar_findings:
+            return {}
+        
+        # Use first finding as base
+        parent = similar_findings[0].copy()
+        
+        # Consolidate data from all similar findings
+        all_urls = []
+        all_payloads = []
+        all_matched_at = []
+        all_extracted_results = []
+        
+        for finding in similar_findings:
+            # Collect URLs
+            if finding.get("url"):
+                all_urls.append(finding["url"])
+            if finding.get("matched_at"):
+                all_matched_at.append(finding["matched_at"])
+            
+            # Collect payloads from curl commands
+            curl = finding.get("curl_command", "")
+            if curl:
+                all_payloads.append(curl)
+            
+            # Collect extracted results
+            if finding.get("extracted_results"):
+                try:
+                    import json
+                    extracted = json.loads(finding["extracted_results"]) if isinstance(finding["extracted_results"], str) else finding["extracted_results"]
+                    all_extracted_results.append(extracted)
+                except:
+                    pass
+        
+        # Store consolidated data
+        parent["vulnerable_urls"] = list(set(all_urls + all_matched_at))[:10]  # Top 10 unique URLs
+        parent["payloads"] = list(set(all_payloads))[:5]  # Top 5 unique payloads
+        parent["consolidated_findings_count"] = len(similar_findings)
+        
+        # Consolidate extracted results (for steps to reproduce)
+        if all_extracted_results:
+            try:
+                import json
+                parent["extracted_results"] = json.dumps({
+                    "consolidated_from": len(similar_findings),
+                    "findings": all_extracted_results,
+                    "steps_to_reproduce": all_extracted_results[0].get("steps_to_reproduce") if all_extracted_results else {}
+                })
+            except:
+                pass
+        
+        parent["dedup_hash"] = self._fuzzy_hash(parent)
+        parent["is_consolidated_group"] = True
+        
+        logger.info(f"Consolidated {len(similar_findings)} similar findings: {parent.get('name')}")
+        
+        return parent
 
     def _exact_hash(self, finding: dict) -> str:
         """Hash: template_id + host + exact matched_at URL."""

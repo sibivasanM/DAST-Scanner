@@ -250,6 +250,22 @@ const ScansView = ({ onViewFindings }) => {
                 <div>{new Date(sc.created_at).toLocaleString()}</div>
                 {sc.completed_at && <div style={{ color: "#10b981" }}>Done {Math.round((new Date(sc.completed_at) - new Date(sc.created_at)) / 60000)}m</div>}
               </div>
+              {sc.status === "completed" && (
+                <button
+                  onClick={e => {
+                    e.stopPropagation();
+                    const link = document.createElement("a");
+                    link.href = `/api/scans/${sc.scan_id}/report/pdf`;
+                    link.download = `report_${sc.scan_id}.pdf`;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                  }}
+                  title="Download PDF Report"
+                  style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #22c55e", background: "#10b98115", color: "#10b981", fontSize: 11, cursor: "pointer", fontWeight: 600 }}>
+                  ↓ PDF
+                </button>
+              )}
               <button onClick={e => { e.stopPropagation(); apiDelete(`/scans/${sc.scan_id}`).then(loadScans); }} style={{ padding: "4px 8px", borderRadius: 4, border: "1px solid #2d3040", background: "transparent", color: "#6b7280", fontSize: 11, cursor: "pointer" }}>✕</button>
             </div>
           </div>
