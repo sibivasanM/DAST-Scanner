@@ -1,4 +1,4 @@
-# VulnForge Platform
+# DAST-Scanner Platform
 
 AI-assisted vulnerability scanning platform that combines **OWASP ZAP**, **Nuclei**, **FastAPI**, **Playwright**, and a **React dashboard** for authenticated and unauthenticated DAST workflows.
 
