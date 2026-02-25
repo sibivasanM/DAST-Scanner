@@ -71,6 +71,8 @@ class Database:
                 poc_evidence    TEXT,
                 dedup_hash      TEXT,
                 scanner_source  TEXT DEFAULT 'nuclei',
+                http_request    TEXT,
+                http_response   TEXT,
                 created_at      TEXT NOT NULL,
 
                 FOREIGN KEY (scan_id) REFERENCES scans(scan_id) ON DELETE CASCADE
@@ -88,12 +90,17 @@ class Database:
         for col, default in [
             ("scanner_engine", "'nuclei'"),
             ("auth_config", "NULL"),
+            ("auth_status", "NULL"),   # JSON: {verified, status_code, message, …}
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE scans ADD COLUMN {col} TEXT DEFAULT {default}")
             except sqlite3.OperationalError:
                 pass
-        for col, default in [("scanner_source", "'nuclei'")]:
+        for col, default in [
+            ("scanner_source", "'nuclei'"),
+            ("http_request",   "NULL"),
+            ("http_response",  "NULL"),
+        ]:
             try:
                 self.conn.execute(f"ALTER TABLE findings ADD COLUMN {col} TEXT DEFAULT {default}")
             except sqlite3.OperationalError:
@@ -122,11 +129,12 @@ class Database:
         row = self.conn.execute("SELECT * FROM scans WHERE scan_id = ?", (scan_id,)).fetchone()
         if row:
             d = dict(row)
-            if d.get("ai_analysis"):
-                try:
-                    d["ai_analysis"] = json.loads(d["ai_analysis"])
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            for field in ("ai_analysis", "auth_status"):
+                if d.get(field):
+                    try:
+                        d[field] = json.loads(d[field])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             return d
         return None
 
@@ -138,7 +146,17 @@ class Database:
             params.append(status)
         q += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
-        return [dict(r) for r in self.conn.execute(q, params).fetchall()]
+        rows = []
+        for r in self.conn.execute(q, params).fetchall():
+            d = dict(r)
+            for field in ("ai_analysis", "auth_status"):
+                if d.get(field):
+                    try:
+                        d[field] = json.loads(d[field])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            rows.append(d)
+        return rows
 
     def delete_scan(self, scan_id: str):
         self.conn.execute("DELETE FROM findings WHERE scan_id = ?", (scan_id,))

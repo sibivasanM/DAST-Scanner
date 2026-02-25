@@ -16,6 +16,7 @@ services:
       - "8080:8080"
     volumes:
       - zap-data:/zap/wrk
+      - zap-scripts:/zap/scripts/vulnforge
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/JSON/core/view/version/?apikey=vulnforge-zap-key"]
       interval: 15s
@@ -41,6 +42,8 @@ services:
     volumes:
       - scan-data:/app/data
       - screenshots:/app/screenshots
+      - zap-scripts:/app/zap-scripts
+      - ./selinium:/app/selinium
     depends_on:
       zap:
         condition: service_healthy
@@ -67,3 +70,4 @@ volumes:
   scan-data:
   screenshots:
   zap-data:
+  zap-scripts:

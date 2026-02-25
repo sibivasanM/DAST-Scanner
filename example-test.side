@@ -1,0 +1,51 @@
+{
+  "id": "example-login-test",
+  "version": "2.0",
+  "name": "Example Web App Login Test",
+  "url": "http://localhost/",
+  "tests": [
+    {
+      "id": "login-test-001",
+      "name": "Login Test",
+      "commands": [
+        {
+          "id": "open-cmd-001",
+          "command": "open",
+          "target": "/login",
+          "value": ""
+        },
+        {
+          "id": "type-username-001",
+          "command": "settext",
+          "target": "id=username",
+          "value": "admin"
+        },
+        {
+          "id": "type-password-001",
+          "command": "settext",
+          "target": "id=password",
+          "value": "admin123"
+        },
+        {
+          "id": "click-submit-001",
+          "command": "click",
+          "target": "id=submitBtn",
+          "value": ""
+        },
+        {
+          "id": "wait-dashboard-001",
+          "command": "waitforelementvisible",
+          "target": "id=dashboard",
+          "value": ""
+        }
+      ]
+    }
+  ],
+  "suites": [
+    {
+      "id": "login-suite-001",
+      "name": "Login Suite",
+      "tests": ["login-test-001"]
+    }
+  ]
+}

@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 libxshmfence1 libx11-xcb1 libxcb-dri3-0 \
     libdbus-glib-1-2 libatspi2.0-0 \
     fonts-liberation fonts-noto-color-emoji fonts-unifont \
+    xvfb xauth dbus \
     && rm -rf /var/lib/apt/lists/*
 
 ARG NUCLEI_VERSION=3.3.7
@@ -23,5 +24,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 COPY . .
 RUN mkdir -p /app/screenshots /app/data
+
+# Create Xvfb startup script
+RUN echo '#!/bin/bash\nset -e\necho "Starting Xvfb..."\nXvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &\nexport DISPLAY=:99\necho "Display set to :99"\nexec "$@"' > /start.sh && chmod +x /start.sh
+
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+ENTRYPOINT ["/start.sh"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

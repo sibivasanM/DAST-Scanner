@@ -1,0 +1,121 @@
+{
+  "metadata": {
+    "side_file": "/tmp/tmp3n028y7p.side",
+    "test_name": "Untitled",
+    "base_url": "https://altoro.testfire.net",
+    "timestamp": "2026-02-24T08:41:42.265242Z",
+    "browser": "chrome",
+    "proxy": null,
+    "test_results": {
+      "test_name": "Untitled",
+      "steps": [
+        {
+          "step": 1,
+          "command": "open",
+          "target": "/",
+          "value": "",
+          "success": true
+        },
+        {
+          "step": 2,
+          "command": "setWindowSize",
+          "target": "1176x930",
+          "value": "",
+          "success": true
+        },
+        {
+          "step": 3,
+          "command": "click",
+          "target": "css=font",
+          "value": "",
+          "success": true
+        },
+        {
+          "step": 4,
+          "command": "click",
+          "target": "id=uid",
+          "value": "",
+          "success": true
+        },
+        {
+          "step": 5,
+          "command": "type",
+          "target": "id=uid",
+          "value": "jsmith",
+          "success": true
+        },
+        {
+          "step": 6,
+          "command": "click",
+          "target": "id=passw",
+          "value": "",
+          "success": true
+        },
+        {
+          "step": 7,
+          "command": "type",
+          "target": "id=passw",
+          "value": "demo1234",
+          "success": true
+        },
+        {
+          "step": 8,
+          "command": "click",
+          "target": "name=btnSubmit",
+          "value": "",
+          "success": true
+        }
+      ],
+      "passed": 8,
+      "failed": 0
+    }
+  },
+  "session": {
+    "current_url": "https://altoro.testfire.net/bank/main.jsp",
+    "page_title": "Altoro Mutual",
+    "all_cookies": [
+      {
+        "domain": "altoro.testfire.net",
+        "httpOnly": false,
+        "name": "AltoroAccounts",
+        "path": "/",
+        "sameSite": "Lax",
+        "secure": false,
+        "value": "\"ODAwMDAyflNhdmluZ3N+NS41MzQwMjMyMjM1MDE1MDk0RTE5fDgwMDAwM35DaGVja2luZ34xLjgzOTgwNzY3MzAxNDA1OUUyMXw0NTM5MDgyMDM5Mzk2Mjg4fkNyZWRpdCBDYXJkfjEwMS45Mnw=\""
+      },
+      {
+        "domain": "altoro.testfire.net",
+        "httpOnly": true,
+        "name": "JSESSIONID",
+        "path": "/",
+        "sameSite": "Lax",
+        "secure": true,
+        "value": "5CD58FFE6A8A680B7A79333DC6395725"
+      }
+    ],
+    "auth_cookies": [
+      {
+        "domain": "altoro.testfire.net",
+        "httpOnly": true,
+        "name": "JSESSIONID",
+        "path": "/",
+        "sameSite": "Lax",
+        "secure": true,
+        "value": "5CD58FFE6A8A680B7A79333DC6395725"
+      }
+    ],
+    "local_storage": {},
+    "session_storage": {},
+    "jwt_tokens": {},
+    "injection_ready": {
+      "cookie_header": "JSESSIONID=5CD58FFE6A8A680B7A79333DC6395725"
+    },
+    "summary": {
+      "total_cookies": 2,
+      "auth_cookies_found": 1,
+      "jwt_tokens_found": 0,
+      "local_storage_keys": 0,
+      "session_storage_keys": 0
+    }
+  }
+}

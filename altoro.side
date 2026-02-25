@@ -1,0 +1,116 @@
+{
+  "id": "305ceac3-dca7-4880-b933-621f57224ae3",
+  "version": "2.0",
+  "name": "altoro",
+  "url": "https://altoro.testfire.net",
+  "tests": [{
+    "id": "ff524a8a-1c3f-4870-ab45-8b832917bfd2",
+    "name": "Untitled",
+    "commands": [{
+      "id": "926ac0cc-9f97-404d-b3d6-518ab1f72004",
+      "comment": "",
+      "command": "open",
+      "target": "/",
+      "targets": [],
+      "value": ""
+    }, {
+      "id": "dd45d653-6d61-41af-bc87-0a065c451cd5",
+      "comment": "",
+      "command": "setWindowSize",
+      "target": "1176x930",
+      "targets": [],
+      "value": ""
+    }, {
+      "id": "c1ef1cd0-ef75-4c82-a039-edaed1124cf5",
+      "comment": "",
+      "command": "click",
+      "target": "css=font",
+      "targets": [
+        ["css=font", "css:finder"],
+        ["xpath=//a[@id='LoginLink']/font", "xpath:idRelative"],
+        ["xpath=//font", "xpath:position"],
+        ["xpath=//font[contains(.,'Sign In')]", "xpath:innerText"]
+      ],
+      "value": ""
+    }, {
+      "id": "c3ebd279-e98e-4efc-8b0a-a5094d22c6dc",
+      "comment": "",
+      "command": "click",
+      "target": "id=uid",
+      "targets": [
+        ["id=uid", "id"],
+        ["name=uid", "name"],
+        ["css=#uid", "css:finder"],
+        ["xpath=//input[@id='uid']", "xpath:attributes"],
+        ["xpath=//form[@id='login']/table/tbody/tr/td[2]/input", "xpath:idRelative"],
+        ["xpath=//td[2]/div/form/table/tbody/tr/td[2]/input", "xpath:position"]
+      ],
+      "value": ""
+    }, {
+      "id": "59cd757d-9a66-4a6e-ba99-997cc99fdb92",
+      "comment": "",
+      "command": "type",
+      "target": "id=uid",
+      "targets": [
+        ["id=uid", "id"],
+        ["name=uid", "name"],
+        ["css=#uid", "css:finder"],
+        ["xpath=//input[@id='uid']", "xpath:attributes"],
+        ["xpath=//form[@id='login']/table/tbody/tr/td[2]/input", "xpath:idRelative"],
+        ["xpath=//td[2]/div/form/table/tbody/tr/td[2]/input", "xpath:position"]
+      ],
+      "value": "jsmith"
+    }, {
+      "id": "fa883eef-b55d-48bb-bbc9-b82f86c828e6",
+      "comment": "",
+      "command": "click",
+      "target": "id=passw",
+      "targets": [
+        ["id=passw", "id"],
+        ["name=passw", "name"],
+        ["css=#passw", "css:finder"],
+        ["xpath=//input[@id='passw']", "xpath:attributes"],
+        ["xpath=//form[@id='login']/table/tbody/tr[2]/td[2]/input", "xpath:idRelative"],
+        ["xpath=//tr[2]/td[2]/input", "xpath:position"]
+      ],
+      "value": ""
+    }, {
+      "id": "9d596c06-d7e4-4d6a-91b7-6e8cfac488df",
+      "comment": "",
+      "command": "type",
+      "target": "id=passw",
+      "targets": [
+        ["id=passw", "id"],
+        ["name=passw", "name"],
+        ["css=#passw", "css:finder"],
+        ["xpath=//input[@id='passw']", "xpath:attributes"],
+        ["xpath=//form[@id='login']/table/tbody/tr[2]/td[2]/input", "xpath:idRelative"],
+        ["xpath=//tr[2]/td[2]/input", "xpath:position"]
+      ],
+      "value": "demo1234"
+    }, {
+      "id": "d3167327-f872-41e7-bf6f-ae439258b7d5",
+      "comment": "",
+      "command": "click",
+      "target": "name=btnSubmit",
+      "targets": [
+        ["name=btnSubmit", "name"],
+        ["css=tr:nth-child(3) input", "css:finder"],
+        ["xpath=//input[@name='btnSubmit']", "xpath:attributes"],
+        ["xpath=//form[@id='login']/table/tbody/tr[3]/td[2]/input", "xpath:idRelative"],
+        ["xpath=//tr[3]/td[2]/input", "xpath:position"]
+      ],
+      "value": ""
+    }]
+  }],
+  "suites": [{
+    "id": "86015888-65fa-498e-885a-e0290e90a5f2",
+    "name": "Default Suite",
+    "persistSession": false,
+    "parallel": false,
+    "timeout": 300,
+    "tests": ["ff524a8a-1c3f-4870-ab45-8b832917bfd2"]
+  }],
+  "urls": ["https://altoro.testfire.net/"],
+  "plugins": []
+}

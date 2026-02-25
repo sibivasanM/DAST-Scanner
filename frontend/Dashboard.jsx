@@ -1,12 +1,27 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, CartesianGrid } from "recharts";
 
 // ── API ──────────────────────────────────────────────────────────────────────
 const API = "/api";
 async function api(path, opts = {}) {
   const r = await fetch(`${API}${path}`, { headers: { "Content-Type": "application/json", ...opts.headers }, ...opts });
-  if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-  return r.json();
+  if (!r.ok) {
+    const text = await r.text();
+    let msg = `${r.status}: ${text}`;
+    try { const j = JSON.parse(text); msg = j.detail || j.message || msg; } catch (e) { /* keep raw msg */ }
+    throw new Error(msg);
+  }
+  const text = await r.text();
+  try { return JSON.parse(text); } catch (e) { throw new Error(`API returned non-JSON: ${text.slice(0, 150)}`); }
+}
+async function apiSafeJson(response) {
+  const text = await response.text();
+  if (!response.ok) {
+    let msg = `${response.status}: ${text}`;
+    try { const j = JSON.parse(text); msg = j.detail || j.message || msg; } catch (e) { /* keep raw msg */ }
+    throw new Error(msg);
+  }
+  try { return JSON.parse(text); } catch (e) { throw new Error(`Server returned non-JSON: ${text.slice(0, 150)}`); }
 }
 const apiGet = (p) => api(p);
 const apiPost = (p, b) => api(p, { method: "POST", body: JSON.stringify(b) });
@@ -16,8 +31,8 @@ const apiDelete = (p) => api(p, { method: "DELETE" });
 const SEV = { critical: "#ef4444", high: "#f97316", medium: "#eab308", low: "#3b82f6", info: "#6b7280" };
 const SEV_BG = { critical: "rgba(239,68,68,.12)", high: "rgba(249,115,22,.12)", medium: "rgba(234,179,8,.10)", low: "rgba(59,130,246,.10)", info: "rgba(107,114,128,.10)" };
 const STAT_C = { open: "#ef4444", confirmed: "#f97316", false_positive: "#6b7280", remediated: "#22c55e" };
-const PH = { initializing: "Init", nuclei_scan: "Nuclei", zap_scan: "ZAP Scan", deduplication: "Dedup", storing_findings: "Storing", ai_analysis: "GPT-4o", poc_generation: "PoC Gen", done: "Done", error: "Error" };
-const PH_ORDER = ["initializing", "nuclei_scan", "zap_scan", "deduplication", "storing_findings", "ai_analysis", "poc_generation", "done"];
+const PH = { initializing: "Init", nuclei_scan: "Nuclei", zap_scan: "ZAP Scan", zap_auth_check: "Auth Check", selenium_login: "Selenium Login", zap_session_injection: "Session Inject", zap_context_config: "ZAP Context", zap_spider: "Spider", deduplication: "Dedup", fp_filtering: "FP Filter", storing_findings: "Storing", ai_analysis: "GPT-4o", evidence_capture: "Evidence", done: "Done", error: "Error" };
+const PH_ORDER = ["initializing", "nuclei_scan", "zap_scan", "zap_auth_check", "selenium_login", "zap_session_injection", "zap_context_config", "zap_spider", "deduplication", "fp_filtering", "storing_findings", "ai_analysis", "evidence_capture", "done"];
 const ENGINE_COLORS = { nuclei: "#8b5cf6", zap: "#f97316", both: "#10b981" };
 
 // ── Components ───────────────────────────────────────────────────────────────
@@ -34,6 +49,46 @@ const Input = ({ label, ...p }) => <div style={{ display: "flex", flexDirection:
 const Select = ({ label, children, ...p }) => <div style={{ display: "flex", flexDirection: "column", gap: 4 }}><label style={{ fontSize: 11, color: "#6b7280", fontWeight: 600, textTransform: "uppercase", letterSpacing: .5 }}>{label}</label><select style={{ padding: "10px 12px", borderRadius: 8, border: "1px solid #2d3040", background: "#0d0f13", color: "#e5e7eb", fontSize: 13, outline: "none" }} {...p}>{children}</select></div>;
 const Tab = ({ active, onClick, children }) => <button onClick={onClick} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 16px", border: "none", borderBottom: active ? "2px solid #10b981" : "2px solid transparent", background: "transparent", color: active ? "#f0f0f0" : "#6b7280", fontSize: 13, fontWeight: active ? 700 : 500, cursor: "pointer", fontFamily: "inherit" }}>{children}</button>;
 
+// ── Toast Notification System ─────────────────────────────────────────────
+let _toastListeners = [];
+const toast = {
+  _id: 0,
+  _emit(t) { _toastListeners.forEach(fn => fn(t)); },
+  success(msg) { this._emit({ id: ++this._id, type: "success", msg }); },
+  error(msg)   { this._emit({ id: ++this._id, type: "error",   msg }); },
+  info(msg)    { this._emit({ id: ++this._id, type: "info",    msg }); },
+};
+
+const ToastContainer = () => {
+  const [toasts, setToasts] = useState([]);
+  useEffect(() => {
+    const handler = (t) => {
+      setToasts(prev => [...prev, t]);
+      setTimeout(() => setToasts(prev => prev.filter(x => x.id !== t.id)), 5000);
+    };
+    _toastListeners.push(handler);
+    return () => { _toastListeners = _toastListeners.filter(fn => fn !== handler); };
+  }, []);
+  const colors = { success: "#10b981", error: "#ef4444", info: "#3b82f6" };
+  return (
+    <div style={{ position: "fixed", bottom: 24, right: 24, zIndex: 9999, display: "flex", flexDirection: "column", gap: 8 }}>
+      {toasts.map(t => (
+        <div key={t.id} style={{
+          padding: "12px 16px", borderRadius: 8, maxWidth: 380, fontSize: 13, fontWeight: 600,
+          background: "#1a1d24", border: `1px solid ${colors[t.type]}40`,
+          color: colors[t.type], boxShadow: "0 4px 20px rgba(0,0,0,.4)",
+          animation: "slideIn .2s ease",
+          display: "flex", alignItems: "flex-start", gap: 8,
+        }}>
+          <span>{t.type === "success" ? "✓" : t.type === "error" ? "✕" : "ℹ"}</span>
+          <span style={{ color: "#d1d5db", fontWeight: 400 }}>{t.msg}</span>
+          <style>{`@keyframes slideIn{from{transform:translateX(20px);opacity:0}to{transform:none;opacity:1}}`}</style>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const ProgressBar = ({ phase }) => {
   const idx = PH_ORDER.indexOf(phase);
   const pct = phase === "done" ? 100 : phase === "error" ? 100 : Math.max(8, ((idx + 1) / PH_ORDER.length) * 100);
@@ -42,60 +97,322 @@ const ProgressBar = ({ phase }) => {
 
 // ── Auth Config Panel ────────────────────────────────────────────────────────
 const AuthPanel = ({ auth, setAuth }) => {
+  const [sideLoading, setSideLoading] = useState(false);
+  const [sideMsg, setSideMsg] = useState(null); // {ok: bool, text: str}
+  const [scanMode, setScanMode] = useState("manual"); // "manual" | "side-file"
+  const [sideFile, setSideFile] = useState(null);
+  const [targetUrl, setTargetUrl] = useState("");
+  const [runScan, setRunScan] = useState(false);
+  const [integratedLoading, setIntegratedLoading] = useState(false);
+
+  const handleSideUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setSideLoading(true);
+    setSideMsg(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const r = await fetch("/api/upload/selenium-test", { method: "POST", body: form });
+      const body = await apiSafeJson(r);
+      
+      // Extract auth configuration from SIDE file
+      const authConfig = body.auth_configuration;
+      if (authConfig.login_url) {
+        setAuth(prev => ({
+          ...prev,
+          auth_type: "form",
+          login_url: authConfig.login_url,
+          username_field: authConfig.username_field || "username",
+          password_field: authConfig.password_field || "password",
+          username: authConfig.username_value || "",
+          password: authConfig.password_value || "",
+          logged_in_indicator: authConfig.success_indicator || ""
+        }));
+        setSideMsg({ ok: true, text: `✓ Loaded Selenium IDE test: ${body.filename} (${body.tests_count} tests)` });
+      } else {
+        setSideMsg({ ok: false, text: "Could not extract login flow from test file" });
+      }
+    } catch (err) {
+      setSideMsg({ ok: false, text: err.message });
+    } finally {
+      setSideLoading(false);
+      e.target.value = "";
+    }
+  };
+
+  const handleIntegratedSideUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file || !targetUrl.trim()) {
+      setSideMsg({ ok: false, text: "Please select a .side file and enter target URL" });
+      return;
+    }
+    setSideFile(file);
+    setSideMsg({ ok: true, text: `✓ Selected: ${file.name} → ${targetUrl}` });
+  };
+
+  const launchIntegratedScan = async () => {
+    if (!sideFile || !targetUrl.trim()) {
+      setSideMsg({ ok: false, text: "Missing .side file or target URL" });
+      return;
+    }
+
+    try {
+      setIntegratedLoading(true);
+      setSideMsg(null);
+
+      const form = new FormData();
+      form.append("file", sideFile);
+
+      const params = new URLSearchParams({
+        target: targetUrl.trim(),
+        run_scan: runScan.toString(),
+        timeout_minutes: "60"
+      });
+
+      const r = await fetch(`/api/scans/authenticated/integrated?${params}`, {
+        method: "POST",
+        body: form
+      });
+
+      const body = await apiSafeJson(r);
+
+      setSideMsg({
+        ok: true,
+        text: `✓ Authenticated scan queued! Scan ID: ${body.scan_id.slice(0, 8)}... — check Scans tab for progress`
+      });
+      toast.info("Authenticated scan queued — authentication in progress...");
+
+      // Reset form
+      setSideFile(null);
+      setTargetUrl("");
+      setRunScan(false);
+    } catch (err) {
+      setSideMsg({ ok: false, text: `Error: ${err.message}` });
+      toast.error(`Auth scan failed: ${err.message}`);
+    } finally {
+      setIntegratedLoading(false);
+    }
+  };
+
   const up = (k, v) => setAuth({ ...auth, [k]: v });
   const t = auth.auth_type;
+  
   return (
     <Card style={{ border: "1px solid #f9731640", marginTop: 12 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: "#e5e7eb" }}>Authentication Config</span>
-        <span style={{ padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: "#f9731618", color: "#f97316" }}>ZAP</span>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-        <Select label="Auth Type" value={t} onChange={e => up("auth_type", e.target.value)}>
-          <option value="none">None (Unauthenticated)</option>
-          <option value="form">Form-Based Login</option>
-          <option value="bearer">Bearer Token</option>
-          <option value="cookie">Cookie Session</option>
-          <option value="header">Custom Header</option>
-        </Select>
-        {t !== "none" && <Input label="Logged-In Indicator (regex)" placeholder="Logout|Dashboard|Welcome" value={auth.logged_in_indicator || ""} onChange={e => up("logged_in_indicator", e.target.value)} />}
+        <span style={{ padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: "#f9731618", color: "#f97316" }}>ZAP + Selenium</span>
       </div>
 
-      {t === "form" && (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
-          <Input label="Login URL *" placeholder="https://app.com/login" value={auth.login_url || ""} onChange={e => up("login_url", e.target.value)} />
-          <div />
-          <Input label="Username Field Name" placeholder="username" value={auth.username_field || "username"} onChange={e => up("username_field", e.target.value)} />
-          <Input label="Password Field Name" placeholder="password" value={auth.password_field || "password"} onChange={e => up("password_field", e.target.value)} />
-          <Input label="Username *" placeholder="admin" value={auth.username || ""} onChange={e => up("username", e.target.value)} />
-          <Input label="Password *" type="password" placeholder="••••••••" value={auth.password || ""} onChange={e => up("password", e.target.value)} />
-          <Input label="Logged-Out Indicator (regex)" placeholder="Login|Sign in" value={auth.logged_out_indicator || ""} onChange={e => up("logged_out_indicator", e.target.value)} />
-        </div>
-      )}
+      {/* Mode Selection */}
+      <div style={{ display: "flex", gap: 12, marginBottom: 14, paddingBottom: 12, borderBottom: "1px solid #1e2028" }}>
+        <button 
+          onClick={() => setScanMode("manual")}
+          style={{ 
+            padding: "6px 14px", 
+            borderRadius: 6, 
+            border: scanMode === "manual" ? "2px solid #10b981" : "1px solid #2d3040",
+            background: scanMode === "manual" ? "#10b98115" : "transparent",
+            color: scanMode === "manual" ? "#10b981" : "#6b7280",
+            fontSize: 12, 
+            fontWeight: 600,
+            cursor: "pointer"
+          }}>
+          Manual Config
+        </button>
+        <button 
+          onClick={() => setScanMode("side-file")}
+          style={{ 
+            padding: "6px 14px", 
+            borderRadius: 6, 
+            border: scanMode === "side-file" ? "2px solid #f97316" : "1px solid #2d3040",
+            background: scanMode === "side-file" ? "#f9731615" : "transparent",
+            color: scanMode === "side-file" ? "#f97316" : "#6b7280",
+            fontSize: 12, 
+            fontWeight: 600,
+            cursor: "pointer"
+          }}>
+          .SIDE File (Direct Scan)
+        </button>
+      </div>
 
-      {t === "bearer" && (
-        <div style={{ marginTop: 12 }}>
-          <Input label="Bearer Token *" placeholder="eyJhbGciOiJIUzI1NiIs..." value={auth.token || ""} onChange={e => up("token", e.target.value)} />
-        </div>
-      )}
+      {scanMode === "side-file" ? (
+        <>
+          {/* Integrated SIDE File Upload & Direct Scan */}
+          <div style={{ marginBottom: 14, padding: "14px", borderRadius: 8, border: "1px dashed #f9731640", background: "#f9731608" }}>
+            <div style={{ fontSize: 11, color: "#f97316", fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 12 }}>
+              Direct Authenticated Scan
+            </div>
+            
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+              <div>
+                <label style={{ fontSize: 10, color: "#6b7280", fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6, display: "block" }}>
+                  Target URL *
+                </label>
+                <input 
+                  type="url"
+                  placeholder="https://example.com"
+                  value={targetUrl}
+                  onChange={e => setTargetUrl(e.target.value)}
+                  style={{ 
+                    width: "100%",
+                    padding: "10px 12px", 
+                    borderRadius: 8, 
+                    border: "1px solid #2d3040", 
+                    background: "#0d0f13", 
+                    color: "#e5e7eb", 
+                    fontSize: 13, 
+                    outline: "none",
+                    fontFamily: "'JetBrains Mono', monospace"
+                  }} 
+                />
+              </div>
+              <div>
+                <label style={{ fontSize: 10, color: "#6b7280", fontWeight: 600, textTransform: "uppercase", letterSpacing: .5, marginBottom: 6, display: "block" }}>
+                  .SIDE File *
+                </label>
+                <label style={{ 
+                  display: "flex", 
+                  alignItems: "center", 
+                  gap: 6, 
+                  padding: "10px 12px", 
+                  borderRadius: 8, 
+                  border: "1px solid #2d3040", 
+                  background: "#1a1d24", 
+                  color: "#9ca3af", 
+                  fontSize: 12, 
+                  cursor: "pointer", 
+                  fontWeight: 600 
+                }}>
+                  {sideFile ? `✓ ${sideFile.name}` : "Choose .side file"}
+                  <input 
+                    type="file" 
+                    accept=".side"
+                    onChange={handleIntegratedSideUpload}
+                    style={{ display: "none" }} 
+                  />
+                </label>
+              </div>
+            </div>
 
-      {t === "cookie" && (
-        <div style={{ marginTop: 12 }}>
-          <Input label="Cookie String *" placeholder="session=abc123; CSRF-Token=xyz" value={auth.cookies || ""} onChange={e => up("cookies", e.target.value)} />
-        </div>
-      )}
+            <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#9ca3af", cursor: "pointer" }}>
+                <input 
+                  type="checkbox" 
+                  checked={runScan} 
+                  onChange={e => setRunScan(e.target.checked)}
+                  style={{ accentColor: "#10b981" }} 
+                />
+                Run Spider + Active Scan (takes longer)
+              </label>
+            </div>
 
-      {t === "header" && (
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginTop: 12 }}>
-          <Input label="Header Name *" placeholder="X-API-Key" value={auth.header_name || "Authorization"} onChange={e => up("header_name", e.target.value)} />
-          <Input label="Header Value *" placeholder="your-api-key-here" value={auth.header_value || ""} onChange={e => up("header_value", e.target.value)} />
-        </div>
-      )}
+            <button 
+              onClick={launchIntegratedScan}
+              disabled={integratedLoading || !sideFile || !targetUrl.trim()}
+              style={{ 
+                padding: "10px 18px", 
+                borderRadius: 6, 
+                border: "none", 
+                background: integratedLoading || !sideFile || !targetUrl.trim() ? "#4b5563" : "#f97316",
+                color: "#fff", 
+                fontSize: 12, 
+                fontWeight: 700, 
+                cursor: integratedLoading ? "wait" : "pointer",
+                opacity: !sideFile || !targetUrl.trim() ? .5 : 1
+              }}>
+              {integratedLoading ? "Scanning..." : "Launch Authenticated Scan"}
+            </button>
+          </div>
 
-      {t !== "none" && (
-        <div style={{ marginTop: 12 }}>
-          <Input label="Exclude URLs (comma-separated regex)" placeholder=".*logout.*, .*reset-password.*" value={(auth.exclude_urls || []).join(", ")} onChange={e => up("exclude_urls", e.target.value.split(",").map(s => s.trim()).filter(Boolean))} />
-        </div>
+          {sideMsg && (
+            <div style={{ 
+              padding: "10px 12px", 
+              borderRadius: 8, 
+              border: sideMsg.ok ? "1px solid #10b98140" : "1px solid #ef444440",
+              background: sideMsg.ok ? "#10b98108" : "#ef444408",
+              color: sideMsg.ok ? "#10b981" : "#ef4444", 
+              fontSize: 12,
+              fontFamily: "'JetBrains Mono', monospace",
+              wordBreak: "break-all"
+            }}>
+              {sideMsg.ok ? "✓" : "✕"} {sideMsg.text}
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          {/* Manual SIDE (Selenium IDE) file import */}
+          <div style={{ marginBottom: 14, padding: "10px 14px", borderRadius: 8, border: "1px dashed #2d3040", background: "#0d0f1320" }}>
+            <div style={{ fontSize: 11, color: "#6b7280", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+              Import Selenium IDE Test <span style={{ color: "#4b5563", fontWeight: 400, textTransform: "none" }}>— .side (Browser automation)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 14px", borderRadius: 6, border: "1px solid #2d3040", background: "#1a1d24", color: sideLoading ? "#4b5563" : "#9ca3af", fontSize: 12, cursor: sideLoading ? "wait" : "pointer", fontWeight: 600, userSelect: "none" }}>
+                {sideLoading ? "Parsing…" : "Choose .side file"}
+                <input type="file" accept=".side" style={{ display: "none" }} onChange={handleSideUpload} disabled={sideLoading} />
+              </label>
+              {sideMsg && (
+                <span style={{ fontSize: 12, color: sideMsg.ok ? "#10b981" : "#ef4444", maxWidth: 360, wordBreak: "break-word" }}>
+                  {sideMsg.ok ? "✓" : "✕"} {sideMsg.text}
+                </span>
+              )}
+            </div>
+            <div style={{ fontSize: 10, color: "#374151", marginTop: 6 }}>
+              Export from Selenium IDE Chrome extension · Automatically extracts login credentials and form fields
+            </div>
+          </div>
+
+          {/* Manual authentication configuration */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <Select label="Auth Type" value={t} onChange={e => up("auth_type", e.target.value)}>
+              <option value="none">None (Unauthenticated)</option>
+              <option value="form">Form-Based Login</option>
+              <option value="bearer">Bearer Token</option>
+              <option value="cookie">Cookie Session</option>
+              <option value="header">Custom Header</option>
+            </Select>
+            {t !== "none" && <Input label="Logged-In Indicator (regex)" placeholder="Logout|Dashboard|Welcome" value={auth.logged_in_indicator || ""} onChange={e => up("logged_in_indicator", e.target.value)} />}
+          </div>
+
+          {t === "form" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+              <Input label="Login URL *" placeholder="https://app.com/login" value={auth.login_url || ""} onChange={e => up("login_url", e.target.value)} />
+              <div />
+              <Input label="Username Field Name" placeholder="username" value={auth.username_field || "username"} onChange={e => up("username_field", e.target.value)} />
+              <Input label="Password Field Name" placeholder="password" value={auth.password_field || "password"} onChange={e => up("password_field", e.target.value)} />
+              <Input label="Username *" placeholder="admin" value={auth.username || ""} onChange={e => up("username", e.target.value)} />
+              <Input label="Password *" type="password" placeholder="••••••••" value={auth.password || ""} onChange={e => up("password", e.target.value)} />
+              <Input label="Logged-Out Indicator (regex)" placeholder="Login|Sign in" value={auth.logged_out_indicator || ""} onChange={e => up("logged_out_indicator", e.target.value)} />
+            </div>
+          )}
+
+          {t === "bearer" && (
+            <div style={{ marginTop: 12 }}>
+              <Input label="Bearer Token *" placeholder="eyJhbGciOiJIUzI1NiIs..." value={auth.token || ""} onChange={e => up("token", e.target.value)} />
+            </div>
+          )}
+
+          {t === "cookie" && (
+            <div style={{ marginTop: 12 }}>
+              <Input label="Cookie String *" placeholder="session=abc123; CSRF-Token=xyz" value={auth.cookies || ""} onChange={e => up("cookies", e.target.value)} />
+            </div>
+          )}
+
+          {t === "header" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginTop: 12 }}>
+              <Input label="Header Name *" placeholder="X-API-Key" value={auth.header_name || "Authorization"} onChange={e => up("header_name", e.target.value)} />
+              <Input label="Header Value *" placeholder="your-api-key-here" value={auth.header_value || ""} onChange={e => up("header_value", e.target.value)} />
+            </div>
+          )}
+
+          {t !== "none" && (
+            <div style={{ marginTop: 12 }}>
+              <Input label="Exclude URLs (comma-separated regex)" placeholder=".*logout.*, .*reset-password.*" value={(auth.exclude_urls || []).join(", ")} onChange={e => up("exclude_urls", e.target.value.split(",").map(s => s.trim()).filter(Boolean))} />
+            </div>
+          )}
+        </>
       )}
     </Card>
   );
@@ -159,9 +476,34 @@ const ScansView = ({ onViewFindings }) => {
   const [doPoC, setDoPoC] = useState(true);
   const [auth, setAuth] = useState({ ...DEFAULT_AUTH });
   const [submitting, setSubmitting] = useState(false);
+  const prevScans = useRef({});
 
   const loadScans = useCallback(async () => {
-    try { setError(null); setScans(await apiGet("/scans?limit=50")); } catch (e) { setError(e.message); } finally { setLoading(false); }
+    try {
+      setError(null);
+      const data = await apiGet("/scans?limit=50");
+      setScans(data);
+      // Notify when auth succeeds or scan completes
+      data.forEach(sc => {
+        const prev = prevScans.current[sc.scan_id] || {};
+        const as = sc.auth_status;
+        // Auth success notification
+        if (as && as.verified && !prev.auth_notified) {
+          toast.success(`Authentication verified for ${sc.target.slice(0, 50)}`);
+          prevScans.current[sc.scan_id] = { ...prev, auth_notified: true };
+        }
+        // Scan complete notification
+        if (sc.status === "completed" && prev.status !== "completed") {
+          const findings = sc.unique_finding_count || 0;
+          toast.success(`Scan completed: ${sc.target.slice(0, 40)} — ${findings} finding${findings !== 1 ? "s" : ""}`);
+        }
+        // Scan failed notification
+        if (sc.status === "failed" && prev.status !== "failed") {
+          toast.error(`Scan failed: ${sc.target.slice(0, 40)}`);
+        }
+        prevScans.current[sc.scan_id] = { ...prev, status: sc.status };
+      });
+    } catch (e) { setError(e.message); } finally { setLoading(false); }
   }, []);
   useEffect(() => { loadScans(); const iv = setInterval(loadScans, 5000); return () => clearInterval(iv); }, [loadScans]);
 
@@ -234,9 +576,23 @@ const ScansView = ({ onViewFindings }) => {
                   color: sc.status === "completed" ? "#10b981" : sc.status === "failed" ? "#ef4444" : sc.status === "scanning" ? "#eab308" : "#6b7280" }}>
                   {sc.status}
                 </span>
-                {sc.auth_config && JSON.parse(sc.auth_config || "{}").auth_type !== "none" && (
-                  <span style={{ padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: "#f9731618", color: "#f97316" }}>AUTH</span>
-                )}
+                {sc.auth_config && (() => {
+                  try { return JSON.parse(sc.auth_config || "{}").auth_type !== "none"; } catch { return false; }
+                })() && (() => {
+                  const as = sc.auth_status;
+                  if (!as) return <span style={{ padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: "#f9731618", color: "#f97316" }}>AUTH</span>;
+                  const ok = as.verified;
+                  const label = ok ? "AUTH OK" : "AUTH FAIL";
+                  const tip = as.message || "";
+                  return (
+                    <span title={tip} style={{ padding: "2px 6px", borderRadius: 4, fontSize: 10, fontWeight: 700, cursor: "help",
+                      background: ok ? "#10b98118" : "#ef444418",
+                      color: ok ? "#10b981" : "#ef4444",
+                      border: `1px solid ${ok ? "#10b98140" : "#ef444440"}` }}>
+                      {ok ? "✓" : "✗"} {label}
+                    </span>
+                  );
+                })()}
               </div>
               <div style={{ display: "flex", gap: 16, fontSize: 12, color: "#6b7280", marginTop: 6 }}>
                 <span>Type: {sc.scan_type}</span>
@@ -350,11 +706,12 @@ const FindingDetail = ({ finding, onBack }) => {
         <div style={{ fontSize: 12, color: "#6b7280", fontFamily: "'JetBrains Mono', monospace", marginTop: 6, wordBreak: "break-all" }}>{f.url || f.matched_at || f.host}</div>
       </Card>
 
-      <div style={{ display: "flex", gap: 0, borderBottom: "1px solid #1e2028" }}>
+      <div style={{ display: "flex", gap: 0, borderBottom: "1px solid #1e2028", flexWrap: "wrap" }}>
         <Tab active={tab === "overview"} onClick={() => setTab("overview")}>Overview</Tab>
         {ai && <Tab active={tab === "ai"} onClick={() => setTab("ai")}>AI Analysis</Tab>}
         <Tab active={tab === "poc"} onClick={() => setTab("poc")}>PoC</Tab>
         {extracted && extracted.evidence && <Tab active={tab === "evidence"} onClick={() => setTab("evidence")}>ZAP Evidence</Tab>}
+        {(f.http_request || f.http_response) && <Tab active={tab === "http"} onClick={() => setTab("http")}>HTTP</Tab>}
         {f.poc_screenshot && <Tab active={tab === "screenshot"} onClick={() => setTab("screenshot")}>Screenshot</Tab>}
       </div>
 
@@ -402,6 +759,35 @@ const FindingDetail = ({ finding, onBack }) => {
         </Card>
       )}
 
+      {tab === "http" && (f.http_request || f.http_response) && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          {f.http_request && (
+            <Card>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: "#3b82f618", color: "#60a5fa", letterSpacing: 0.5 }}>REQUEST</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#e5e7eb" }}>HTTP Request</span>
+                </div>
+                <button onClick={() => navigator.clipboard?.writeText(f.http_request || "")} style={{ padding: "4px 12px", borderRadius: 6, border: "1px solid #2d3040", background: "transparent", color: "#9ca3af", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>Copy</button>
+              </div>
+              <pre style={{ margin: 0, padding: 14, borderRadius: 8, background: "#0a0c10", border: "1px solid #1e2740", color: "#93c5fd", fontSize: 11, lineHeight: 1.6, fontFamily: "'JetBrains Mono', monospace", overflow: "auto", maxHeight: 400, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{f.http_request}</pre>
+            </Card>
+          )}
+          {f.http_response && (
+            <Card>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: "#10b98118", color: "#34d399", letterSpacing: 0.5 }}>RESPONSE</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#e5e7eb" }}>HTTP Response</span>
+                </div>
+                <button onClick={() => navigator.clipboard?.writeText(f.http_response || "")} style={{ padding: "4px 12px", borderRadius: 6, border: "1px solid #2d3040", background: "transparent", color: "#9ca3af", fontSize: 11, cursor: "pointer", fontFamily: "inherit" }}>Copy</button>
+              </div>
+              <pre style={{ margin: 0, padding: 14, borderRadius: 8, background: "#0a0c10", border: "1px solid #1e2d1e", color: "#6ee7b7", fontSize: 11, lineHeight: 1.6, fontFamily: "'JetBrains Mono', monospace", overflow: "auto", maxHeight: 400, whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{f.http_response}</pre>
+            </Card>
+          )}
+        </div>
+      )}
+
       {tab === "screenshot" && f.poc_screenshot && <Card><div style={{ fontSize: 13, fontWeight: 700, color: "#e5e7eb", marginBottom: 12 }}>Screenshot</div><img src={f.poc_screenshot} alt="Evidence" style={{ width: "100%", borderRadius: 8, border: "1px solid #1e2028" }} onError={e => { e.target.style.display = "none"; }} /></Card>}
     </div>
   );
@@ -419,6 +805,7 @@ export default function VulnerabilityScannerApp() {
 
   return (
     <div style={{ display: "flex", minHeight: "100vh", background: "#0a0c10", color: "#e5e7eb", fontFamily: "'DM Sans', 'Segoe UI', system-ui, sans-serif" }}>
+      <ToastContainer />
       <aside style={{ width: 220, background: "#0d0f13", borderRight: "1px solid #1e2028", padding: "20px 12px", display: "flex", flexDirection: "column", flexShrink: 0 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", marginBottom: 28 }}>
           <div style={{ width: 28, height: 28, borderRadius: 8, background: "linear-gradient(135deg, #10b981, #059669)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 900, color: "#fff" }}>V</div>

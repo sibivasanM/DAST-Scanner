@@ -12,7 +12,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.colors import HexColor, white
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image, HRFlowable
+from reportlab.lib.enums import TA_LEFT
 
 
 class PDFReportGenerator:
@@ -70,109 +71,188 @@ class PDFReportGenerator:
         if findings:
             sorted_findings = self._sort_findings(findings)
             for idx, finding in enumerate(sorted_findings, 1):
-                story.append(Paragraph(f"<b>{idx}. {self._safe_str(finding.get('name', 'Unknown'))[:80]}</b> [{finding.get('severity', 'info').upper()}]", styles["Heading3"]))
-                
-                # Details as text
-                details_text = []
-                details_text.append(f"<b>Host:</b> {self._safe_str(finding.get('host', 'N/A'))[:60]}")
-                details_text.append(f"<b>URL:</b> {self._safe_str(finding.get('url', finding.get('matched_at', 'N/A')))[:80]}")
-                details_text.append(f"<b>CVE:</b> {self._safe_str(finding.get('cve_id', 'N/A'))[:50]}")
-                details_text.append(f"<b>CVSS:</b> {finding.get('cvss_score', 'N/A')}")
-                details_text.append(f"<b>Type:</b> {self._safe_str(finding.get('vuln_type', 'N/A'))[:50]}")
-                details_text.append(f"<b>Source:</b> {self._safe_str(finding.get('scanner_source', 'nuclei')).upper()}")
-                
-                for detail in details_text:
-                    story.append(Paragraph(detail, styles["Normal"]))
-                
-                # Consolidated URLs (if grouped finding)
-                if finding.get("is_consolidated_group"):
-                    story.append(Paragraph(f"<b>Consolidated Findings:</b> {finding.get('consolidated_findings_count', 1)} similar instances found", styles["Normal"]))
-                    
-                    vulnerable_urls = finding.get("vulnerable_urls", [])
+                story.append(Paragraph(
+                    f"<b>{idx}. {self._safe_str(finding.get('name', 'Unknown'))[:80]}</b> "
+                    f"[{finding.get('severity', 'info').upper()}]",
+                    styles["Heading3"],
+                ))
+
+                # ── Basic metadata ────────────────────────────────────────────
+                for line in [
+                    f"<b>Host:</b> {self._safe_str(finding.get('host', 'N/A'))[:80]}",
+                    f"<b>URL:</b> {self._safe_str(finding.get('url', finding.get('matched_at', 'N/A')))[:100]}",
+                    f"<b>CVE:</b> {self._safe_str(finding.get('cve_id', 'N/A'))[:50]}",
+                    f"<b>CVSS:</b> {finding.get('cvss_score', 'N/A')}",
+                    f"<b>Type:</b> {self._safe_str(finding.get('vuln_type', 'N/A'))[:60]}",
+                    f"<b>Source:</b> {self._safe_str(finding.get('scanner_source', 'nuclei')).upper()}",
+                ]:
+                    story.append(Paragraph(line, styles["Normal"]))
+
+                # ── Parse extracted_results once ──────────────────────────────
+                extracted: dict = {}
+                if finding.get("extracted_results"):
+                    try:
+                        extracted = (
+                            json.loads(finding["extracted_results"])
+                            if isinstance(finding["extracted_results"], str)
+                            else finding["extracted_results"]
+                        )
+                        if not isinstance(extracted, dict):
+                            extracted = {}
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        extracted = {}
+
+                # ── Consolidated group info ───────────────────────────────────
+                if extracted.get("is_consolidated_group"):
+                    story.append(Paragraph(
+                        f"<b>Consolidated Instances:</b> "
+                        f"{extracted.get('consolidated_from', 1)} similar findings grouped",
+                        styles["Normal"],
+                    ))
+                    vulnerable_urls = extracted.get("vulnerable_urls", [])
                     if vulnerable_urls:
-                        story.append(Paragraph("<b>Vulnerable URLs:</b>", styles["Normal"]))
-                        for url in vulnerable_urls[:5]:  # Show top 5
-                            story.append(Paragraph(f"  • {self._safe_str(url)[:100]}", styles["Normal"]))
-                        if len(vulnerable_urls) > 5:
-                            story.append(Paragraph(f"  ... and {len(vulnerable_urls) - 5} more URLs", styles["Normal"]))
-                    
-                    payloads = finding.get("payloads", [])
-                    if payloads:
-                        story.append(Paragraph("<b>Payloads Used:</b>", styles["Normal"]))
-                        for payload in payloads[:3]:  # Show top 3
-                            story.append(Paragraph(f"  • {self._safe_str(payload)[:100]}", styles["Normal"]))
-                        if len(payloads) > 3:
-                            story.append(Paragraph(f"  ... and {len(payloads) - 3} more payloads", styles["Normal"]))
-                
-                # Description
+                        story.append(Paragraph("<b>Affected URLs:</b>", styles["Normal"]))
+                        for vurl in vulnerable_urls[:10]:
+                            story.append(Paragraph(
+                                f"  • {self._safe_str(vurl)[:120]}", styles["Normal"]
+                            ))
+                        if len(vulnerable_urls) > 10:
+                            story.append(Paragraph(
+                                f"  … and {len(vulnerable_urls) - 10} more URLs", styles["Normal"]
+                            ))
+
+                # ── Attack / evidence details (ZAP or Nuclei) ─────────────────
+                for label, key in [("Parameter", "param"), ("Attack Payload", "attack"),
+                                    ("Evidence", "evidence")]:
+                    val = extracted.get(key, "") or ""
+                    if val:
+                        story.append(Paragraph(
+                            f"<b>{label}:</b> {self._safe_str(val)[:300]}", styles["Normal"]
+                        ))
+
+                # Curl command
+                curl = (finding.get("curl_command") or extracted.get("curl") or "").strip()
+                if curl:
+                    story.append(Paragraph("<b>Request (curl):</b>", styles["Normal"]))
+                    story.append(Paragraph(self._safe_str(curl)[:500], styles["Normal"]))
+
+                # ── Description ───────────────────────────────────────────────
                 if finding.get("description"):
-                    desc = self._safe_str(finding.get("description", ""))[:300]
-                    story.append(Paragraph(f"<b>Description:</b> {desc}", styles["Normal"]))
-                
-                # AI Analysis
+                    story.append(Paragraph(
+                        f"<b>Description:</b> {self._safe_str(finding['description'])[:400]}",
+                        styles["Normal"],
+                    ))
+
+                # ── AI Analysis ───────────────────────────────────────────────
                 if finding.get("ai_analysis"):
                     try:
-                        ai_data = json.loads(finding.get("ai_analysis", "{}"))
-                        if ai_data and isinstance(ai_data, dict):
+                        ai_data = json.loads(finding["ai_analysis"])
+                        if isinstance(ai_data, dict):
                             if ai_data.get("business_impact"):
-                                impact = self._safe_str(ai_data.get("business_impact", ""))[:300]
-                                story.append(Paragraph(f"<b>Business Impact:</b> {impact}", styles["Normal"]))
+                                story.append(Paragraph(
+                                    f"<b>Business Impact:</b> "
+                                    f"{self._safe_str(ai_data['business_impact'])[:300]}",
+                                    styles["Normal"],
+                                ))
                             if ai_data.get("remediation"):
-                                remediation = self._safe_str(ai_data.get("remediation", ""))[:300]
-                                story.append(Paragraph(f"<b>Remediation:</b> {remediation}", styles["Normal"]))
+                                story.append(Paragraph(
+                                    f"<b>Remediation:</b> "
+                                    f"{self._safe_str(ai_data['remediation'])[:300]}",
+                                    styles["Normal"],
+                                ))
                     except (json.JSONDecodeError, TypeError):
                         pass
-                
-                # Tags
+
+                # ── Tags ──────────────────────────────────────────────────────
                 if finding.get("tags"):
                     try:
-                        tags = finding.get("tags")
+                        tags = finding["tags"]
                         if isinstance(tags, str):
                             tags = json.loads(tags) if tags else []
                         if tags and isinstance(tags, list):
-                            tags_str = ", ".join(self._safe_str(str(t))[:20] for t in tags[:5])
-                            story.append(Paragraph(f"<b>Tags:</b> {tags_str}", styles["Normal"]))
+                            story.append(Paragraph(
+                                f"<b>Tags:</b> "
+                                f"{', '.join(self._safe_str(str(t))[:20] for t in tags[:8])}",
+                                styles["Normal"],
+                            ))
                     except (json.JSONDecodeError, TypeError):
                         pass
-                
+
                 story.append(Spacer(1, 0.15 * inch))
-                
-                # Steps to reproduce section
-                steps_to_reproduce = {}
-                if finding.get("extracted_results"):
-                    try:
-                        extracted = json.loads(finding["extracted_results"]) if isinstance(finding["extracted_results"], str) else finding["extracted_results"]
-                        steps_to_reproduce = extracted.get("steps_to_reproduce", {})
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                
-                steps = steps_to_reproduce.get("steps", []) if steps_to_reproduce else []
-                screenshots = steps_to_reproduce.get("screenshots", []) if steps_to_reproduce else []
-                
+
+                # ── HTTP Request / Response ───────────────────────────────────
+                http_req = (finding.get("http_request") or "").strip()
+                http_resp = (finding.get("http_response") or "").strip()
+                if http_req or http_resp:
+                    story.append(Paragraph("<b>HTTP Transaction</b>", styles["Heading3"]))
+                    mono_style = ParagraphStyle(
+                        "Mono",
+                        parent=styles["Normal"],
+                        fontName="Courier",
+                        fontSize=7.5,
+                        leading=10,
+                        leftIndent=6,
+                        rightIndent=6,
+                        backColor=HexColor("#f4f4f4"),
+                        borderPadding=(4, 4, 4, 4),
+                        wordWrap="CJK",
+                    )
+                    if http_req:
+                        story.append(Paragraph("<b>Request:</b>", styles["Normal"]))
+                        # Limit to 3KB for PDF readability
+                        req_display = http_req[:3000] + ("…[truncated]" if len(http_req) > 3000 else "")
+                        story.append(Paragraph(self._safe_str(req_display), mono_style))
+                        story.append(Spacer(1, 0.08 * inch))
+                    if http_resp:
+                        story.append(Paragraph("<b>Response:</b>", styles["Normal"]))
+                        resp_display = http_resp[:3000] + ("…[truncated]" if len(http_resp) > 3000 else "")
+                        story.append(Paragraph(self._safe_str(resp_display), mono_style))
+                        story.append(Spacer(1, 0.08 * inch))
+
+                # ── Steps to Reproduce ────────────────────────────────────────
+                str_data = extracted.get("steps_to_reproduce", {})
+                if not isinstance(str_data, dict):
+                    str_data = {}
+                steps = str_data.get("steps", [])
+
                 if steps:
                     story.append(Paragraph("<b>Steps to Reproduce:</b>", styles["Heading3"]))
-                    for idx, step in enumerate(steps, 1):
-                        story.append(Paragraph(f"<b>Step {idx}:</b> {self._safe_str(step)}", styles["Normal"]))
-                        if screenshots and idx <= len(screenshots):
-                            screenshot_path = screenshots[idx-1]
-                            if screenshot_path and os.path.exists(screenshot_path):
-                                try:
-                                    img = Image(screenshot_path, width=4*inch, height=2.5*inch)
-                                    story.append(img)
-                                    story.append(Spacer(1, 0.1 * inch))
-                                except Exception as e:
-                                    story.append(Paragraph(f"<b>Step Screenshot Error:</b> {e}", styles["Normal"]))
-                    
-                    # Embed evidence image if available
-                    screenshot_path = finding.get("poc_screenshot") or (finding.get("evidence") and finding["evidence"].get("screenshot"))
-                    if screenshot_path and os.path.exists(screenshot_path):
-                        try:
-                            story.append(Paragraph("<b>Evidence Screenshot:</b>", styles["Normal"]))
-                            img = Image(screenshot_path, width=5*inch, height=3*inch)
-                            story.append(img)
-                            story.append(Spacer(1, 0.1 * inch))
-                        except Exception as e:
-                            story.append(Paragraph(f"<b>Screenshot Error:</b> {e}", styles["Normal"]))
+                    for step_num, step in enumerate(steps, 1):
+                        story.append(Paragraph(
+                            f"<b>Step {step_num}:</b> {self._safe_str(step)}", styles["Normal"]
+                        ))
+                    story.append(Spacer(1, 0.1 * inch))
+
+                # ── Evidence Screenshot (primary PoC) ─────────────────────────
+                poc_shot = finding.get("poc_screenshot") or ""
+                if poc_shot and os.path.exists(poc_shot):
+                    try:
+                        story.append(Paragraph("<b>Evidence Screenshot:</b>", styles["Normal"]))
+                        story.append(Image(poc_shot, width=5 * inch, height=3 * inch))
+                        story.append(Spacer(1, 0.1 * inch))
+                    except Exception as e:
+                        story.append(Paragraph(
+                            f"<i>Screenshot unavailable: {e}</i>", styles["Normal"]
+                        ))
+
+                # ── Per-instance screenshots (consolidated groups) ─────────────
+                instance_shots = extracted.get("instance_screenshots", [])
+                if instance_shots:
+                    story.append(Paragraph(
+                        "<b>Per-Instance Evidence:</b>", styles["Heading3"]
+                    ))
+                    for inst in instance_shots:
+                        inst_url = self._safe_str(inst.get("url", ""))[:120]
+                        inst_path = inst.get("screenshot", "")
+                        story.append(Paragraph(f"  URL: {inst_url}", styles["Normal"]))
+                        if inst_path and os.path.exists(inst_path):
+                            try:
+                                story.append(Image(inst_path, width=5 * inch, height=3 * inch))
+                                story.append(Spacer(1, 0.1 * inch))
+                            except Exception:
+                                pass
+
+                story.append(Spacer(1, 0.2 * inch))
         else:
             story.append(Paragraph("No vulnerabilities found in this scan.", styles["Normal"]))
 
@@ -183,12 +263,17 @@ class PDFReportGenerator:
 
     def _build_summary_data(self, findings: List[Dict[str, Any]]) -> List[List[str]]:
         """Build summary statistics data."""
-        total = len(findings)
-        critical = sum(1 for f in findings if f.get("severity") == "critical")
-        high = sum(1 for f in findings if f.get("severity") == "high")
-        medium = sum(1 for f in findings if f.get("severity") == "medium")
-        low = sum(1 for f in findings if f.get("severity") == "low")
-        info = sum(1 for f in findings if f.get("severity") == "info")
+        # Ensure findings is a list of dicts
+        if not isinstance(findings, list):
+            findings = []
+        
+        valid_findings = [f for f in findings if isinstance(f, dict)]
+        total = len(valid_findings)
+        critical = sum(1 for f in valid_findings if f.get("severity") == "critical")
+        high = sum(1 for f in valid_findings if f.get("severity") == "high")
+        medium = sum(1 for f in valid_findings if f.get("severity") == "medium")
+        low = sum(1 for f in valid_findings if f.get("severity") == "low")
+        info = sum(1 for f in valid_findings if f.get("severity") == "info")
 
         return [
             ["Metric", "Count"],
@@ -202,14 +287,19 @@ class PDFReportGenerator:
 
     def _build_severity_data(self, findings: List[Dict[str, Any]]) -> List[List[str]]:
         """Build severity breakdown data."""
+        # Ensure findings is a list of dicts
+        if not isinstance(findings, list):
+            findings = []
+        
+        valid_findings = [f for f in findings if isinstance(f, dict)]
         severity_counts = {sev: 0 for sev in self.severity_order}
-        for finding in findings:
+        for finding in valid_findings:
             sev = finding.get("severity", "info").lower()
             if sev in severity_counts:
                 severity_counts[sev] += 1
 
         data = [["Severity", "Count", "Percentage"]]
-        total = len(findings) or 1
+        total = len(valid_findings) or 1
         for sev in self.severity_order:
             count = severity_counts[sev]
             pct = round((count / total) * 100, 1)
@@ -219,8 +309,10 @@ class PDFReportGenerator:
 
     def _sort_findings(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sort findings by severity."""
+        # Ensure all findings are dicts
+        valid_findings = [f for f in findings if isinstance(f, dict)]
         return sorted(
-            findings,
+            valid_findings,
             key=lambda f: (
                 self.severity_order.index(f.get("severity", "info").lower()),
                 f.get("name", ""),

@@ -90,7 +90,7 @@ class DeduplicationEngine:
     def _consolidate_findings(self, similar_findings: list[dict]) -> dict:
         """
         Consolidate multiple similar findings into one grouped finding.
-        Stores all URLs, payloads, and steps together.
+        Stores all URLs, payloads, and steps together in extracted_results JSON.
         """
         if not similar_findings:
             return {}
@@ -125,25 +125,22 @@ class DeduplicationEngine:
                 except:
                     pass
         
-        # Store consolidated data
-        parent["vulnerable_urls"] = list(set(all_urls + all_matched_at))[:10]  # Top 10 unique URLs
-        parent["payloads"] = list(set(all_payloads))[:5]  # Top 5 unique payloads
-        parent["consolidated_findings_count"] = len(similar_findings)
-        
-        # Consolidate extracted results (for steps to reproduce)
-        if all_extracted_results:
-            try:
-                import json
-                parent["extracted_results"] = json.dumps({
-                    "consolidated_from": len(similar_findings),
-                    "findings": all_extracted_results,
-                    "steps_to_reproduce": all_extracted_results[0].get("steps_to_reproduce") if all_extracted_results else {}
-                })
-            except:
-                pass
+        # Store consolidated data in extracted_results JSON field
+        try:
+            import json
+            consolidated_data = {
+                "is_consolidated_group": True,
+                "consolidated_from": len(similar_findings),
+                "vulnerable_urls": list(set(all_urls + all_matched_at))[:10],  # Top 10 unique URLs
+                "payloads": list(set(all_payloads))[:5],  # Top 5 unique payloads
+                "findings": all_extracted_results,
+                "steps_to_reproduce": all_extracted_results[0].get("steps_to_reproduce") if all_extracted_results else {}
+            }
+            parent["extracted_results"] = json.dumps(consolidated_data)
+        except Exception as e:
+            logger.warning(f"Failed to consolidate extracted results: {e}")
         
         parent["dedup_hash"] = self._fuzzy_hash(parent)
-        parent["is_consolidated_group"] = True
         
         logger.info(f"Consolidated {len(similar_findings)} similar findings: {parent.get('name')}")
         
