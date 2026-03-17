@@ -8,3 +8,4 @@ selenium==4.15.2
 python-multipart==0.0.12
 reportlab==4.0.9
 lxml==4.9.4
+sslyze==6.1.0

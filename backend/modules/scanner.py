@@ -22,7 +22,7 @@ SCAN_PROFILES = {
     "quick": {
         "rate_limit": 300, "bulk_size": 50, "concurrency": 30,
         "timeout": 10, "retries": 1,
-        "extra_flags": ["-as"],  # automatic scan (top templates only)
+        "extra_flags": [],  # all templates — no -as restriction
     },
     "full": {
         "rate_limit": 150, "bulk_size": 25, "concurrency": 25,
@@ -40,6 +40,36 @@ class NucleiScanner:
 
     def __init__(self, nuclei_path: Optional[str] = None):
         self.nuclei_path = nuclei_path or shutil.which("nuclei") or "nuclei"
+
+    async def update_templates(self) -> bool:
+        """
+        Run `nuclei -update-templates` to pull the latest template set.
+        Returns True on success, False if the update failed (scan can still proceed
+        with the existing local templates).
+        """
+        logger.info("[SCAN] Updating Nuclei templates…")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.nuclei_path, "-update-templates",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            out = ((stdout or b"") + (stderr or b"")).decode(errors="replace").strip()
+            if out:
+                logger.info(f"[SCAN] Template update output:\n{out[:2000]}")
+            if proc.returncode == 0:
+                logger.info("[SCAN] Nuclei templates updated successfully.")
+                return True
+            else:
+                logger.warning(f"[SCAN] Template update exited with code {proc.returncode} — proceeding with existing templates.")
+                return False
+        except asyncio.TimeoutError:
+            logger.warning("[SCAN] Template update timed out after 5 min — proceeding with existing templates.")
+            return False
+        except Exception as e:
+            logger.warning(f"[SCAN] Template update failed: {e} — proceeding with existing templates.")
+            return False
 
     async def check_health(self) -> bool:
         try:
@@ -63,6 +93,7 @@ class NucleiScanner:
         tags: list[str] = None,
         custom_templates: Optional[str] = None,
         scan_type: str = "full",
+        exclude_urls_file: Optional[str] = None,
     ) -> list[dict]:
         """Run Nuclei against a target and return parsed findings."""
         profile = SCAN_PROFILES.get(scan_type, SCAN_PROFILES["full"])
@@ -92,6 +123,9 @@ class NucleiScanner:
 
         if custom_templates and os.path.exists(custom_templates):
             cmd.extend(["-t", custom_templates])
+
+        if exclude_urls_file and os.path.exists(exclude_urls_file):
+            cmd.extend(["-eu", exclude_urls_file])  # -eu = exclude URLs file (Nuclei v3)
 
         cmd.extend(profile.get("extra_flags", []))
 

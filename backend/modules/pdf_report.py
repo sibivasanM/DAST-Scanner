@@ -6,14 +6,77 @@ import json
 import os
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+from PIL import Image as PILImage
 
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
-from reportlab.lib.colors import HexColor, white
+from reportlab.lib.colors import HexColor, white, black
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image, HRFlowable
-from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
+
+# Max width for screenshots inside the PDF content area
+_MAX_IMG_WIDTH  = 6.5 * inch
+_MAX_IMG_HEIGHT = 4.0 * inch
+
+
+def _embed_image(path: str, max_width: float = _MAX_IMG_WIDTH, max_height: float = _MAX_IMG_HEIGHT) -> Optional[Image]:
+    """
+    Return a ReportLab Image that fits within max_width × max_height while
+    preserving the original aspect ratio.  Returns None if the file doesn't
+    exist or can't be opened.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with PILImage.open(path) as im:
+            orig_w, orig_h = im.size
+        if orig_w == 0 or orig_h == 0:
+            return None
+        scale = min(max_width / orig_w, max_height / orig_h, 1.0)
+        return Image(path, width=orig_w * scale, height=orig_h * scale)
+    except Exception:
+        return None
+
+
+def _screenshot_caption(finding: dict) -> str:
+    """Return a human-readable caption describing what the screenshot shows."""
+    tags    = str(finding.get("tags", "")).lower()
+    name    = str(finding.get("name", "")).lower()
+    vtype   = str(finding.get("vuln_type", "")).lower()
+    combined = f"{tags} {name} {vtype}"
+
+    replay = finding.get("replay_verified")
+
+    if any(k in combined for k in ("xss", "cross-site", "cross-site-scripting")):
+        base = "XSS — alert() dialog confirmed via DOM overlay"
+    elif any(k in combined for k in ("cookie", "httponly", "samesite", "secure flag")):
+        base = "Cookie Security — missing attribute flags highlighted"
+    elif any(k in combined for k in ("csp", "content-security-policy", "content security policy")):
+        base = "CSP Evaluation — policy analysed via CSP Evaluator"
+    elif any(k in combined for k in ("sqli", "sql-injection", "sql injection")):
+        base = "SQL Injection — database error / response diff captured"
+    elif any(k in combined for k in ("open-redirect", "redirect")):
+        base = "Open Redirect — final redirect destination shown"
+    elif any(k in combined for k in ("header", "hsts", "x-frame", "x-content")):
+        base = "Missing Security Header — header presence table overlay"
+    elif any(k in combined for k in ("path-traversal", "directory-traversal", "lfi", "rfi")):
+        base = "Path Traversal — sensitive file content highlighted"
+    elif any(k in combined for k in ("rce", "command-injection", "code-injection")):
+        base = "RCE / Command Injection — output indicators highlighted"
+    elif any(k in combined for k in ("info", "disclosure", "exposure")):
+        base = "Information Disclosure — sensitive data highlighted"
+    else:
+        base = "Proof-of-Concept — finding context captured"
+
+    if replay is True:
+        return f"{base}  ✓ REPLAY CONFIRMED"
+    elif replay is False:
+        return f"{base}  ⚠ REPLAY UNVERIFIED (transient)"
+    return base
 
 
 class PDFReportGenerator:
@@ -21,6 +84,104 @@ class PDFReportGenerator:
 
     def __init__(self):
         self.severity_order = ["critical", "high", "medium", "low", "info"]
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+
+    def _caption_style(self, styles):
+        return ParagraphStyle(
+            "Caption",
+            parent=styles["Normal"],
+            fontSize=8,
+            leading=11,
+            textColor=HexColor("#555555"),
+            leftIndent=4,
+            spaceAfter=4,
+        )
+
+    def _badge_style(self, styles, color: str):
+        return ParagraphStyle(
+            "Badge",
+            parent=styles["Normal"],
+            fontSize=8,
+            leading=11,
+            textColor=white,
+            backColor=HexColor(color),
+            leftIndent=6,
+            rightIndent=6,
+            borderPadding=(3, 6, 3, 6),
+        )
+
+    def _mono_style(self, styles):
+        return ParagraphStyle(
+            "Mono",
+            parent=styles["Normal"],
+            fontName="Courier",
+            fontSize=7.5,
+            leading=10,
+            leftIndent=6,
+            rightIndent=6,
+            backColor=HexColor("#f4f4f4"),
+            borderPadding=(4, 4, 4, 4),
+            wordWrap="CJK",
+        )
+
+    # ── Auth proof section ────────────────────────────────────────────────────
+
+    def _add_auth_proof(self, story, scan: dict, styles):
+        """If the scan has an auth proof screenshot, add an Auth section."""
+        auth_status_raw = scan.get("auth_status")
+        if not auth_status_raw:
+            return
+        try:
+            auth_status = (
+                json.loads(auth_status_raw)
+                if isinstance(auth_status_raw, str)
+                else auth_status_raw
+            )
+        except (json.JSONDecodeError, TypeError):
+            return
+
+        if not isinstance(auth_status, dict):
+            return
+
+        auth_shot = auth_status.get("auth_screenshot") or ""
+        img = _embed_image(auth_shot)
+        if img is None:
+            return
+
+        story.append(Paragraph("<b>Authentication Proof</b>", styles["Heading2"]))
+        story.append(Paragraph(
+            "The screenshot below was captured immediately after successful login, "
+            "confirming the scanner ran with an authenticated session.",
+            styles["Normal"],
+        ))
+        story.append(Spacer(1, 0.1 * inch))
+        story.append(img)
+        story.append(Paragraph(
+            f"Logged in as: {self._safe_str(auth_status.get('username', 'N/A'))}  |  "
+            f"Method: {self._safe_str(auth_status.get('auth_type', 'form'))}",
+            self._caption_style(styles),
+        ))
+        story.append(Spacer(1, 0.3 * inch))
+
+    # ── Replay badge ──────────────────────────────────────────────────────────
+
+    def _add_replay_badge(self, story, finding: dict, styles):
+        """Add a coloured replay-verification badge when present."""
+        replay = finding.get("replay_verified")
+        if replay is True:
+            story.append(Paragraph(
+                "✓  REPLAY CONFIRMED — evidence re-verified by live HTTP replay",
+                self._badge_style(styles, "#166534"),   # dark green
+            ))
+        elif replay is False:
+            story.append(Paragraph(
+                "⚠  REPLAY UNVERIFIED — evidence not present on replay (may be transient)",
+                self._badge_style(styles, "#92400e"),   # amber
+            ))
+        # None → no badge (replay not attempted or inconclusive)
+
+    # ── Main generate ─────────────────────────────────────────────────────────
 
     def generate_report(
         self,
@@ -37,7 +198,7 @@ class PDFReportGenerator:
         # Title
         story.append(Paragraph(f"<b>{report_title}</b>", styles["Heading1"]))
         story.append(Spacer(1, 0.2 * inch))
-        
+
         # Scan info
         story.append(Paragraph(f"<b>Target:</b> {scan.get('target', 'Unknown')}", styles["Normal"]))
         story.append(Paragraph(f"<b>Scan Type:</b> {scan.get('scan_type', 'N/A')}", styles["Normal"]))
@@ -61,6 +222,9 @@ class PDFReportGenerator:
         story.append(severity_table)
         story.append(Spacer(1, 0.3 * inch))
 
+        # Auth proof screenshot (if available)
+        self._add_auth_proof(story, scan, styles)
+
         # Page break before findings
         story.append(PageBreak())
 
@@ -76,6 +240,9 @@ class PDFReportGenerator:
                     f"[{finding.get('severity', 'info').upper()}]",
                     styles["Heading3"],
                 ))
+
+                # Replay badge (immediately under the title)
+                self._add_replay_badge(story, finding, styles)
 
                 # ── Basic metadata ────────────────────────────────────────────
                 for line in [
@@ -104,21 +271,33 @@ class PDFReportGenerator:
 
                 # ── Consolidated group info ───────────────────────────────────
                 if extracted.get("is_consolidated_group"):
+                    count = extracted.get("consolidated_from", 1)
                     story.append(Paragraph(
-                        f"<b>Consolidated Instances:</b> "
-                        f"{extracted.get('consolidated_from', 1)} similar findings grouped",
+                        f"<b>Consolidated Group:</b> {count} confirmed vulnerable instance{'' if count == 1 else 's'} on the same host",
                         styles["Normal"],
                     ))
                     vulnerable_urls = extracted.get("vulnerable_urls", [])
                     if vulnerable_urls:
-                        story.append(Paragraph("<b>Affected URLs:</b>", styles["Normal"]))
-                        for vurl in vulnerable_urls[:10]:
+                        story.append(Spacer(1, 4))
+                        story.append(Paragraph(f"<b>All Affected URLs ({len(vulnerable_urls)}):</b>", styles["Normal"]))
+                        for i, vurl in enumerate(vulnerable_urls, 1):
                             story.append(Paragraph(
-                                f"  • {self._safe_str(vurl)[:120]}", styles["Normal"]
+                                f"  {i}. {self._safe_str(vurl)[:140]}", styles["Normal"]
                             ))
-                        if len(vulnerable_urls) > 10:
+                    instance_params = extracted.get("instance_params", [])
+                    if instance_params:
+                        story.append(Spacer(1, 4))
+                        story.append(Paragraph(
+                            f"<b>Vulnerable Parameters:</b> {', '.join(self._safe_str(p)[:40] for p in instance_params[:20])}",
+                            styles["Normal"],
+                        ))
+                    instance_attacks = extracted.get("instance_attacks", [])
+                    if instance_attacks:
+                        story.append(Spacer(1, 4))
+                        story.append(Paragraph(f"<b>Attack Payloads ({len(instance_attacks)}):</b>", styles["Normal"]))
+                        for atk in instance_attacks[:10]:
                             story.append(Paragraph(
-                                f"  … and {len(vulnerable_urls) - 10} more URLs", styles["Normal"]
+                                f"  • {self._safe_str(atk)[:120]}", styles["Normal"]
                             ))
 
                 # ── Attack / evidence details (ZAP or Nuclei) ─────────────────
@@ -185,28 +364,16 @@ class PDFReportGenerator:
                 http_resp = (finding.get("http_response") or "").strip()
                 if http_req or http_resp:
                     story.append(Paragraph("<b>HTTP Transaction</b>", styles["Heading3"]))
-                    mono_style = ParagraphStyle(
-                        "Mono",
-                        parent=styles["Normal"],
-                        fontName="Courier",
-                        fontSize=7.5,
-                        leading=10,
-                        leftIndent=6,
-                        rightIndent=6,
-                        backColor=HexColor("#f4f4f4"),
-                        borderPadding=(4, 4, 4, 4),
-                        wordWrap="CJK",
-                    )
+                    mono = self._mono_style(styles)
                     if http_req:
                         story.append(Paragraph("<b>Request:</b>", styles["Normal"]))
-                        # Limit to 3KB for PDF readability
                         req_display = http_req[:3000] + ("…[truncated]" if len(http_req) > 3000 else "")
-                        story.append(Paragraph(self._safe_str(req_display), mono_style))
+                        story.append(Paragraph(self._safe_str(req_display), mono))
                         story.append(Spacer(1, 0.08 * inch))
                     if http_resp:
                         story.append(Paragraph("<b>Response:</b>", styles["Normal"]))
                         resp_display = http_resp[:3000] + ("…[truncated]" if len(http_resp) > 3000 else "")
-                        story.append(Paragraph(self._safe_str(resp_display), mono_style))
+                        story.append(Paragraph(self._safe_str(resp_display), mono))
                         story.append(Spacer(1, 0.08 * inch))
 
                 # ── Steps to Reproduce ────────────────────────────────────────
@@ -225,15 +392,19 @@ class PDFReportGenerator:
 
                 # ── Evidence Screenshot (primary PoC) ─────────────────────────
                 poc_shot = finding.get("poc_screenshot") or ""
-                if poc_shot and os.path.exists(poc_shot):
-                    try:
-                        story.append(Paragraph("<b>Evidence Screenshot:</b>", styles["Normal"]))
-                        story.append(Image(poc_shot, width=5 * inch, height=3 * inch))
-                        story.append(Spacer(1, 0.1 * inch))
-                    except Exception as e:
-                        story.append(Paragraph(
-                            f"<i>Screenshot unavailable: {e}</i>", styles["Normal"]
-                        ))
+                img = _embed_image(poc_shot)
+                if img is not None:
+                    caption = _screenshot_caption(finding)
+                    story.append(Paragraph("<b>Evidence Screenshot:</b>", styles["Normal"]))
+                    story.append(Spacer(1, 0.05 * inch))
+                    story.append(img)
+                    story.append(Paragraph(caption, self._caption_style(styles)))
+                    story.append(Spacer(1, 0.1 * inch))
+                elif poc_shot:
+                    story.append(Paragraph(
+                        f"<i>Screenshot file not found: {self._safe_str(poc_shot)}</i>",
+                        styles["Normal"],
+                    ))
 
                 # ── Per-instance screenshots (consolidated groups) ─────────────
                 instance_shots = extracted.get("instance_screenshots", [])
@@ -242,17 +413,17 @@ class PDFReportGenerator:
                         "<b>Per-Instance Evidence:</b>", styles["Heading3"]
                     ))
                     for inst in instance_shots:
-                        inst_url = self._safe_str(inst.get("url", ""))[:120]
+                        inst_url  = self._safe_str(inst.get("url", ""))[:120]
                         inst_path = inst.get("screenshot", "")
                         story.append(Paragraph(f"  URL: {inst_url}", styles["Normal"]))
-                        if inst_path and os.path.exists(inst_path):
-                            try:
-                                story.append(Image(inst_path, width=5 * inch, height=3 * inch))
-                                story.append(Spacer(1, 0.1 * inch))
-                            except Exception:
-                                pass
+                        inst_img = _embed_image(inst_path)
+                        if inst_img is not None:
+                            story.append(inst_img)
+                            story.append(Spacer(1, 0.1 * inch))
 
                 story.append(Spacer(1, 0.2 * inch))
+                story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e5e7eb")))
+                story.append(Spacer(1, 0.1 * inch))
         else:
             story.append(Paragraph("No vulnerabilities found in this scan.", styles["Normal"]))
 
@@ -263,17 +434,16 @@ class PDFReportGenerator:
 
     def _build_summary_data(self, findings: List[Dict[str, Any]]) -> List[List[str]]:
         """Build summary statistics data."""
-        # Ensure findings is a list of dicts
         if not isinstance(findings, list):
             findings = []
-        
+
         valid_findings = [f for f in findings if isinstance(f, dict)]
-        total = len(valid_findings)
+        total    = len(valid_findings)
         critical = sum(1 for f in valid_findings if f.get("severity") == "critical")
-        high = sum(1 for f in valid_findings if f.get("severity") == "high")
-        medium = sum(1 for f in valid_findings if f.get("severity") == "medium")
-        low = sum(1 for f in valid_findings if f.get("severity") == "low")
-        info = sum(1 for f in valid_findings if f.get("severity") == "info")
+        high     = sum(1 for f in valid_findings if f.get("severity") == "high")
+        medium   = sum(1 for f in valid_findings if f.get("severity") == "medium")
+        low      = sum(1 for f in valid_findings if f.get("severity") == "low")
+        info     = sum(1 for f in valid_findings if f.get("severity") == "info")
 
         return [
             ["Metric", "Count"],
@@ -287,10 +457,9 @@ class PDFReportGenerator:
 
     def _build_severity_data(self, findings: List[Dict[str, Any]]) -> List[List[str]]:
         """Build severity breakdown data."""
-        # Ensure findings is a list of dicts
         if not isinstance(findings, list):
             findings = []
-        
+
         valid_findings = [f for f in findings if isinstance(f, dict)]
         severity_counts = {sev: 0 for sev in self.severity_order}
         for finding in valid_findings:
@@ -304,12 +473,11 @@ class PDFReportGenerator:
             count = severity_counts[sev]
             pct = round((count / total) * 100, 1)
             data.append([sev.capitalize(), str(count), f"{pct}%"])
-        
+
         return data
 
     def _sort_findings(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Sort findings by severity."""
-        # Ensure all findings are dicts
         valid_findings = [f for f in findings if isinstance(f, dict)]
         return sorted(
             valid_findings,
@@ -322,14 +490,14 @@ class PDFReportGenerator:
     def _get_table_style(self) -> TableStyle:
         """Get standard table styling."""
         return TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), HexColor("#1e2028")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 11),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-            ("BACKGROUND", (0, 1), (-1, -1), HexColor("#f9fafb")),
-            ("GRID", (0, 0), (-1, -1), 1, HexColor("#e5e7eb")),
-            ("TOPPADDING", (0, 1), (-1, -1), 8),
+            ("BACKGROUND",    (0, 0), (-1, 0),  HexColor("#1e2028")),
+            ("TEXTCOLOR",     (0, 0), (-1, 0),  white),
+            ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0, 0), (-1, 0),  11),
+            ("BOTTOMPADDING", (0, 0), (-1, 0),  12),
+            ("BACKGROUND",    (0, 1), (-1, -1), HexColor("#f9fafb")),
+            ("GRID",          (0, 0), (-1, -1), 1, HexColor("#e5e7eb")),
+            ("TOPPADDING",    (0, 1), (-1, -1), 8),
             ("BOTTOMPADDING", (0, 1), (-1, -1), 8),
         ])
 

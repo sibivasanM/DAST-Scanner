@@ -108,6 +108,7 @@ class SeleniumAuthCapture:
             "session_valid": False,
             "page_content": "",
             "authenticated_pages_visited": [],
+            "auth_screenshot": None,
         }
 
         try:
@@ -143,14 +144,25 @@ class SeleniumAuthCapture:
             logger.info("[Selenium] Submitting login form...")
             await self._submit_login_form(password_field)
 
-            # Wait for navigation or timeout
+            # Wait for the URL to change away from the login page (redirect after login)
+            login_url_base = login_url.split("?")[0].rstrip("/")
             try:
-                await self.page.wait_for_load_state("domcontentloaded", timeout=self.browser_timeout)
-            except Exception as e:
-                logger.warning(f"[Selenium] Wait timeout (may still be logged in): {e}")
+                await self.page.wait_for_url(
+                    lambda url: url.split("?")[0].rstrip("/") != login_url_base,
+                    timeout=self.browser_timeout,
+                )
+                logger.info(f"[Selenium] Redirected to: {self.page.url}")
+            except Exception:
+                logger.warning("[Selenium] URL did not change after submit — may be SPA or error page")
+
+            # Wait for full page load (network quiet) so the authenticated page renders
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass  # networkidle can time out on busy SPAs — continue anyway
 
             # Give page time to stabilize
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
             # Capture session data
             logger.info("[Selenium] Capturing session data...")
@@ -188,9 +200,18 @@ class SeleniumAuthCapture:
                     except Exception as e:
                         logger.warning(f"[Selenium] Failed to visit {page_url}: {e}")
 
-            # Take screenshot after login
-            logger.info("[Selenium] Taking screenshot of authenticated page...")
-            # await self.page.screenshot(path="screenshots/authenticated_page.png")
+            # Take screenshot of the authenticated page (proof of login)
+            # At this point the browser is on the post-login page, NOT the login form
+            logger.info(f"[Selenium] Taking auth proof screenshot (current URL: {self.page.url})...")
+            os.makedirs("screenshots", exist_ok=True)
+            screenshot_filename = f"auth_proof_{int(time.time())}.png"
+            screenshot_path = f"screenshots/{screenshot_filename}"
+            try:
+                await self.page.screenshot(path=screenshot_path, full_page=False)
+                result["auth_screenshot"] = screenshot_filename
+                logger.info(f"[Selenium] ✓ Auth proof screenshot saved: {screenshot_path}")
+            except Exception as ss_err:
+                logger.warning(f"[Selenium] Screenshot failed (non-fatal): {ss_err}")
 
             result["success"] = True
             result["message"] = f"Login successful; session_valid={result['session_valid']}"
@@ -303,6 +324,7 @@ class SeleniumAuthCapture:
             "session_valid": False,
             "page_content": "",
             "authenticated_pages_visited": [],
+            "auth_screenshot": None,
         }
 
         try:
@@ -367,8 +389,12 @@ class SeleniumAuthCapture:
                 except Exception as e:
                     logger.warning(f"[Selenium] Command [{command}] failed (non-fatal): {e}")
 
-            # Let the page settle after last command
-            await asyncio.sleep(2)
+            # Wait for full page load after last command (ensures post-login page is rendered)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass  # networkidle can time out on busy SPAs — continue anyway
+            await asyncio.sleep(1)
 
             # Extract session
             await self._extract_session_data(result)
@@ -386,6 +412,17 @@ class SeleniumAuthCapture:
                     logger.warning(f"[Selenium] Logged-in indicator NOT found: {logged_in_indicator}")
             else:
                 result["session_valid"] = bool(result["cookies"] or result["token"])
+
+            # Take screenshot after command replay as proof of authentication
+            os.makedirs("screenshots", exist_ok=True)
+            screenshot_filename = f"auth_proof_{int(time.time())}.png"
+            screenshot_path = f"screenshots/{screenshot_filename}"
+            try:
+                await self.page.screenshot(path=screenshot_path, full_page=False)
+                result["auth_screenshot"] = screenshot_filename
+                logger.info(f"[Selenium] ✓ Auth proof screenshot saved: {screenshot_path}")
+            except Exception as ss_err:
+                logger.warning(f"[Selenium] Screenshot failed (non-fatal): {ss_err}")
 
             result["success"] = True
             result["message"] = f"Command replay done; session_valid={result['session_valid']}, cookies={len(result['cookies'])}"

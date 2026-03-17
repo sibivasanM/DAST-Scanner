@@ -37,6 +37,10 @@ class ZapScanOrchestrator:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.last_session_check = time.time()
+        # Re-auth state (set per run_authenticated_scan call)
+        self._target_url: str = ""
+        self._reauth_config: Optional[Dict] = None
+        self.reauth_count: int = 0
 
     async def run_authenticated_scan(
         self,
@@ -46,6 +50,8 @@ class ZapScanOrchestrator:
         scan_type: str = "full",
         timeout_minutes: int = 60,
         logged_in_indicator: Optional[str] = None,
+        reauth_config: Optional[Dict] = None,
+        previous_urls: Optional[set] = None,
     ) -> Dict[str, Any]:
         """
         Run complete spidering and active scanning workflow.
@@ -75,6 +81,11 @@ class ZapScanOrchestrator:
                 "session_valid_at_end": bool,
             }
         """
+        # Store per-run state for re-auth callbacks
+        self._target_url = target_url
+        self._reauth_config = reauth_config
+        self.reauth_count = 0
+
         result = {
             "success": False,
             "scanner_id": None,
@@ -88,6 +99,10 @@ class ZapScanOrchestrator:
             "errors": [],
             "alerts": [],
             "session_valid_at_end": False,
+            "reauth_count": 0,
+            "crawled_urls": [],
+            "incremental_new_urls": 0,
+            "incremental_skipped_urls": 0,
         }
 
         start_time = time.time()
@@ -114,14 +129,32 @@ class ZapScanOrchestrator:
 
                 # Wait for spider to complete with progress monitoring
                 logger.info(f"[ZAP Scan] Waiting for spider {spider_id} to complete...")
-                urls_found = await self._wait_for_spider(
+                urls_found, crawled_urls = await self._wait_for_spider(
                     client,
                     spider_id,
                     timeout_seconds=timeout_seconds,
                     logged_in_indicator=logged_in_indicator,
                 )
                 result["urls_found"] = urls_found
+                result["crawled_urls"] = crawled_urls
                 logger.info(f"[ZAP Scan] ✓ Spider completed; found {urls_found} URLs")
+
+                # ── Incremental mode: exclude already-known URLs from active scan ─
+                if previous_urls:
+                    new_urls = [u for u in crawled_urls if u not in previous_urls]
+                    skipped = len(crawled_urls) - len(new_urls)
+                    result["incremental_new_urls"] = len(new_urls)
+                    result["incremental_skipped_urls"] = skipped
+                    if skipped > 0:
+                        logger.info(
+                            f"[ZAP Scan] Incremental mode: {len(new_urls)} new URLs, "
+                            f"{skipped} known URLs excluded from active scan"
+                        )
+                        await self._exclude_known_urls_from_context(
+                            client, context_name, crawled_urls, previous_urls
+                        )
+                    else:
+                        logger.info("[ZAP Scan] Incremental mode: all URLs are new, running full active scan")
 
                 # ── Phase 2: Run Active Scan ──────────────────────────────────────
                 logger.info("[ZAP Scan] ▶ Phase 2: Active Scanning")
@@ -159,10 +192,19 @@ class ZapScanOrchestrator:
 
                 duration = time.time() - start_time
                 result["duration_seconds"] = int(duration)
+                result["reauth_count"] = self.reauth_count
                 result["success"] = True
+                incremental_note = ""
+                if result["incremental_skipped_urls"]:
+                    incremental_note = (
+                        f", incremental: {result['incremental_new_urls']} new "
+                        f"/ {result['incremental_skipped_urls']} skipped"
+                    )
                 result["message"] = (
                     f"Scan completed in {int(duration)}s: "
                     f"spidered {urls_found} URLs, found {len(alerts)} alerts"
+                    + (f", re-authenticated {self.reauth_count}x" if self.reauth_count else "")
+                    + incremental_note
                 )
 
                 logger.info(f"[ZAP Scan] ✓ {result['message']}")
@@ -261,13 +303,14 @@ class ZapScanOrchestrator:
                     logger.info(f"[ZAP Scan] Spider completed (status: {status}%)")
                     break
 
-                # Verify session still active
+                # Verify session still active; re-authenticate if expired
                 if logged_in_indicator and (now - self.last_session_check) > 30:
                     valid = await self._verify_session_still_active(
-                        client, "", logged_in_indicator
+                        client, self._target_url, logged_in_indicator
                     )
                     if not valid:
-                        logger.warning("[ZAP Scan] ⚠ Session may have expired during spider")
+                        logger.warning("[ZAP Scan] ⚠ Session expired during spider — attempting re-auth")
+                        await self._reauth_and_reinject()
                     self.last_session_check = now
 
                 await asyncio.sleep(5)
@@ -276,16 +319,19 @@ class ZapScanOrchestrator:
                 logger.warning(f"[ZAP Scan] Error checking spider status: {e}")
                 await asyncio.sleep(5)
 
-        # Get spider results (number of URLs found)
+        # Get all discovered URLs from ZAP session (reliable across spider types)
         try:
-            results = await self._zap_call(client, component, "view", "results", {"scanId": spider_id})
-            urls = results.get("results", {})
-            url_count = len(urls) if isinstance(urls, dict) else len(urls) if isinstance(urls, list) else 0
-            logger.info(f"[ZAP Scan] Spider found {url_count} unique URLs")
-            return url_count
+            url_resp = await self._zap_call(client, "core", "view", "urls", {})
+            url_list = url_resp.get("urls", [])
+            if isinstance(url_list, list):
+                url_list = [u for u in url_list if isinstance(u, str) and u.startswith("http")]
+            else:
+                url_list = []
+            logger.info(f"[ZAP Scan] Spider found {len(url_list)} unique URLs")
+            return len(url_list), url_list
         except Exception as e:
-            logger.warning(f"[ZAP Scan] Could not retrieve spider results: {e}")
-            return 0
+            logger.warning(f"[ZAP Scan] Could not retrieve spider URL list: {e}")
+            return 0, []
 
     async def _run_active_scan(
         self,
@@ -360,15 +406,14 @@ class ZapScanOrchestrator:
                     logger.info(f"[ZAP Scan] Active scan completed (status: {status}%)")
                     break
 
-                # Verify session still active
+                # Verify session still active; re-authenticate if expired
                 if logged_in_indicator and (now - self.last_session_check) > 30:
                     valid = await self._verify_session_still_active(
-                        client, "", logged_in_indicator
+                        client, self._target_url, logged_in_indicator
                     )
                     if not valid:
-                        logger.warning("[ZAP Scan] ⚠ Session may have expired during active scan")
-                        logger.warning("[ZAP Scan] Attempting to detect and re-inject session...")
-                        # In production, would re-authenticate and re-inject here
+                        logger.warning("[ZAP Scan] ⚠ Session expired during active scan — attempting re-auth")
+                        await self._reauth_and_reinject()
                     self.last_session_check = now
 
                 await asyncio.sleep(5)
@@ -418,6 +463,101 @@ class ZapScanOrchestrator:
         except Exception as e:
             logger.warning(f"[ZAP Scan] Session verification failed: {e}")
             return True  # Assume still active on error (be optimistic)
+
+    async def _reauth_and_reinject(self) -> bool:
+        """
+        Re-authenticate using stored credentials and re-inject the fresh session into ZAP.
+
+        Called automatically when the logged-in indicator is no longer found mid-scan,
+        which indicates the session token has expired.  The scan itself keeps running —
+        ZAP will use the new session for all subsequent requests.
+
+        Returns:
+            True if re-authentication and injection succeeded, False otherwise.
+        """
+        if not self._reauth_config:
+            logger.warning("[ZAP Scan] No reauth_config supplied — cannot re-authenticate")
+            return False
+
+        try:
+            from .selenium_auth import SeleniumAuthCapture
+            from .zap_session_injector import ZapSessionInjector
+
+            logger.info("[ZAP Scan] ↻ Re-authenticating with stored credentials…")
+
+            selenium = SeleniumAuthCapture(
+                zap_proxy_host=self._reauth_config.get("zap_proxy_host", "zap"),
+                zap_proxy_port=int(self._reauth_config.get("zap_proxy_port", 8080)),
+            )
+
+            session = await selenium.capture_session(
+                login_url=self._reauth_config["login_url"],
+                username=self._reauth_config.get("username"),
+                password=self._reauth_config.get("password"),
+                username_field=self._reauth_config.get("username_field", "username"),
+                password_field=self._reauth_config.get("password_field", "password"),
+                logged_in_indicator=self._reauth_config.get("logged_in_indicator"),
+            )
+
+            if not session["success"]:
+                logger.error(f"[ZAP Scan] Re-auth login failed: {session['message']}")
+                return False
+
+            injector = ZapSessionInjector(api_url=self.api_url, api_key=self.api_key)
+            result = await injector.inject_session(
+                target_url=self._target_url,
+                session_data=session,
+                session_name=f"vulnforge-reauth-{int(time.time())}",
+            )
+
+            if result["success"]:
+                self.reauth_count += 1
+                logger.info(
+                    f"[ZAP Scan] ✓ Re-auth #{self.reauth_count} succeeded "
+                    f"(auth_type={session.get('auth_type')}) — scan continues"
+                )
+                return True
+
+            logger.error(f"[ZAP Scan] Re-injection failed: {result['message']}")
+            return False
+
+        except Exception as exc:
+            logger.error(f"[ZAP Scan] Re-auth exception: {exc}")
+            return False
+
+    async def _exclude_known_urls_from_context(
+        self,
+        client: httpx.AsyncClient,
+        context_name: str,
+        all_urls: List[str],
+        known_urls: set,
+        max_exclusions: int = 200,
+    ) -> None:
+        """
+        Exclude previously-crawled URLs from the ZAP context so the active scan
+        only tests new/changed URLs.  Capped at max_exclusions to avoid excessive
+        API calls when the URL set is very large.
+        """
+        import re as _re
+
+        urls_to_exclude = [u for u in all_urls if u in known_urls][:max_exclusions]
+        excluded = 0
+        for url in urls_to_exclude:
+            try:
+                await self._zap_call(
+                    client,
+                    "context",
+                    "action",
+                    "excludeFromContext",
+                    {"contextName": context_name, "regex": f"^{_re.escape(url)}$"},
+                )
+                excluded += 1
+            except Exception as e:
+                logger.debug(f"[ZAP Scan] Could not exclude URL from context: {url} — {e}")
+
+        logger.info(
+            f"[ZAP Scan] Excluded {excluded}/{len(urls_to_exclude)} known URLs from context '{context_name}'"
+        )
 
     async def _get_alerts(self, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
         """Retrieve all alerts from ZAP."""

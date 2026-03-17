@@ -73,6 +73,9 @@ class Database:
                 scanner_source  TEXT DEFAULT 'nuclei',
                 http_request    TEXT,
                 http_response   TEXT,
+                replay_verified TEXT,
+                replay_result   TEXT,
+                ai_fp_reason    TEXT,
                 created_at      TEXT NOT NULL,
 
                 FOREIGN KEY (scan_id) REFERENCES scans(scan_id) ON DELETE CASCADE
@@ -85,21 +88,42 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_findings_source ON findings(scanner_source);
             CREATE INDEX IF NOT EXISTS idx_scans_status    ON scans(status);
             CREATE INDEX IF NOT EXISTS idx_scans_engine    ON scans(scanner_engine);
+            CREATE INDEX IF NOT EXISTS idx_scans_target    ON scans(target);
+
+            CREATE TABLE IF NOT EXISTS scan_schedules (
+                id           TEXT PRIMARY KEY,
+                target       TEXT NOT NULL,
+                config       TEXT NOT NULL,
+                interval     TEXT NOT NULL DEFAULT 'weekly',
+                next_run     TEXT NOT NULL,
+                last_run     TEXT,
+                last_scan_id TEXT,
+                enabled      INTEGER DEFAULT 1,
+                created_at   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedules_target   ON scan_schedules(target);
+            CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON scan_schedules(next_run);
         """)
         # Migration: add columns if upgrading from older schema
         for col, default in [
-            ("scanner_engine", "'nuclei'"),
-            ("auth_config", "NULL"),
-            ("auth_status", "NULL"),   # JSON: {verified, status_code, message, …}
+            ("scanner_engine",  "'nuclei'"),
+            ("auth_config",     "NULL"),
+            ("auth_status",     "NULL"),   # JSON: {verified, status_code, message, …}
+            ("crawled_urls",    "NULL"),   # JSON list of URLs discovered during spider/nuclei phase
+            ("parent_scan_id",  "NULL"),   # scan_id this was rescanned from
+            ("is_incremental",  "0"),      # 1 if incremental mode was used
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE scans ADD COLUMN {col} TEXT DEFAULT {default}")
             except sqlite3.OperationalError:
                 pass
         for col, default in [
-            ("scanner_source", "'nuclei'"),
-            ("http_request",   "NULL"),
-            ("http_response",  "NULL"),
+            ("scanner_source",  "'nuclei'"),
+            ("http_request",    "NULL"),
+            ("http_response",   "NULL"),
+            ("replay_verified", "NULL"),   # True/False/None from HTTP replay verifier
+            ("replay_result",   "NULL"),   # JSON: {status_code, reason, …}
+            ("ai_fp_reason",    "NULL"),   # reason string when AI scorer flags as FP
         ]:
             try:
                 self.conn.execute(f"ALTER TABLE findings ADD COLUMN {col} TEXT DEFAULT {default}")
@@ -165,12 +189,26 @@ class Database:
 
     # ── Findings ─────────────────────────────────────────────────────────────
 
+    # Known findings table columns — any extra keys on the dict are silently dropped
+    _FINDING_COLUMNS = frozenset({
+        "id", "scan_id", "template_id", "name", "severity", "description",
+        "host", "matched_at", "url", "curl_command", "extracted_results",
+        "tags", "reference", "matcher_name", "vuln_type", "cve_id", "cvss_score",
+        "status", "notes", "assigned_to", "ai_analysis", "poc_script",
+        "poc_screenshot", "poc_evidence", "dedup_hash", "scanner_source",
+        "http_request", "http_response", "replay_verified", "replay_result",
+        "ai_fp_reason", "created_at",
+    })
+
     def insert_finding(self, finding: dict):
-        cols = ", ".join(finding.keys())
-        placeholders = ", ".join(["?"] * len(finding))
+        # Strip keys that don't exist as columns (e.g. fp_reason, replay_result dicts)
+        clean = {k: (v if not isinstance(v, (dict, list)) else __import__("json").dumps(v))
+                 for k, v in finding.items() if k in self._FINDING_COLUMNS}
+        cols = ", ".join(clean.keys())
+        placeholders = ", ".join(["?"] * len(clean))
         self.conn.execute(
             f"INSERT OR IGNORE INTO findings ({cols}) VALUES ({placeholders})",
-            list(finding.values()),
+            list(clean.values()),
         )
         self.conn.commit()
 
@@ -196,7 +234,7 @@ class Database:
             return d
         return None
 
-    def get_findings(self, scan_id=None, severity=None, status=None, limit=100, offset=0) -> list[dict]:
+    def get_findings(self, scan_id=None, severity=None, status=None, scanner_source=None, limit=100, offset=0) -> list[dict]:
         q = "SELECT * FROM findings WHERE 1=1"
         params = []
         if scan_id:
@@ -208,6 +246,9 @@ class Database:
         if status:
             q += " AND status = ?"
             params.append(status)
+        if scanner_source:
+            q += " AND scanner_source = ?"
+            params.append(scanner_source)
         q += (" ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
               "WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, created_at DESC "
               "LIMIT ? OFFSET ?")
@@ -265,6 +306,86 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_previous_crawled_urls(self, target: str) -> set:
+        """Return the crawled URL set from the most recent completed scan of the same target."""
+        row = self.conn.execute(
+            "SELECT crawled_urls FROM scans "
+            "WHERE target = ? AND status = 'completed' AND crawled_urls IS NOT NULL "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (target,),
+        ).fetchone()
+        if row and row["crawled_urls"]:
+            try:
+                return set(json.loads(row["crawled_urls"]))
+            except (json.JSONDecodeError, TypeError):
+                return set()
+        return set()
+
     def finding_hash_exists(self, dedup_hash: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM findings WHERE dedup_hash = ? LIMIT 1", (dedup_hash,)).fetchone()
         return row is not None
+
+    def get_scans_by_target(self, target: str, limit: int = 20) -> list[dict]:
+        """Return all scans for a target ordered newest first."""
+        rows = self.conn.execute(
+            "SELECT scan_id, target, scan_type, scanner_engine, status, phase, "
+            "raw_finding_count, unique_finding_count, created_at, completed_at, error, "
+            "parent_scan_id, is_incremental "
+            "FROM scans WHERE target = ? ORDER BY created_at DESC LIMIT ?",
+            (target, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_distinct_targets(self) -> list[dict]:
+        """Return each unique target with its scan count and latest scan metadata."""
+        rows = self.conn.execute(
+            "SELECT target, COUNT(*) as scan_count, MAX(created_at) as last_scan_at, "
+            "SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count "
+            "FROM scans GROUP BY target ORDER BY last_scan_at DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Schedules ─────────────────────────────────────────────────────────────
+
+    def create_schedule(self, schedule_id: str, target: str, config: str,
+                        interval: str, next_run: str) -> None:
+        self.conn.execute(
+            "INSERT INTO scan_schedules (id, target, config, interval, next_run, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (schedule_id, target, config, interval, next_run,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        self.conn.commit()
+
+    def get_schedules(self, enabled_only: bool = False) -> list[dict]:
+        q = "SELECT * FROM scan_schedules"
+        if enabled_only:
+            q += " WHERE enabled = 1"
+        q += " ORDER BY next_run ASC"
+        return [dict(r) for r in self.conn.execute(q).fetchall()]
+
+    def get_schedule(self, schedule_id: str) -> Optional[dict]:
+        row = self.conn.execute(
+            "SELECT * FROM scan_schedules WHERE id = ?", (schedule_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_schedule(self, schedule_id: str, **kwargs) -> None:
+        if not kwargs:
+            return
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        vals = list(kwargs.values()) + [schedule_id]
+        self.conn.execute(f"UPDATE scan_schedules SET {sets} WHERE id = ?", vals)
+        self.conn.commit()
+
+    def delete_schedule(self, schedule_id: str) -> None:
+        self.conn.execute("DELETE FROM scan_schedules WHERE id = ?", (schedule_id,))
+        self.conn.commit()
+
+    def get_due_schedules(self) -> list[dict]:
+        """Return enabled schedules whose next_run is at or before now."""
+        now = datetime.now(timezone.utc).isoformat()
+        rows = self.conn.execute(
+            "SELECT * FROM scan_schedules WHERE enabled = 1 AND next_run <= ?", (now,)
+        ).fetchall()
+        return [dict(r) for r in rows]

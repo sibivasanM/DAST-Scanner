@@ -5,7 +5,8 @@
  *
  * NASHORN (old)  →  GRAALVM (required)
  * ----------------------------------------------------
- * importPackage(org.example)      →  var Cls = Java.type("org.example.Cls")
+ * 
+ * (org.example)      →  var Cls = Java.type("org.example.Cls")
  * importClass(org.example.Foo)    →  var Foo = Java.type("org.example.Foo")
  * new java.lang.String("x")       →  Java.type("java.lang.String").valueOf("x")
  *
@@ -50,16 +51,13 @@ function authenticate(helper, paramsValues, credentials) {
     print("[ZAP Auth] Login response: " + msg.getResponseHeader().getStatusCode());
     return msg;
 }
-
 /** Parameters that appear in the ZAP UI for this script. */
 function getRequiredParamsNames() {
     return ["Login URL"];
 }
-
 function getOptionalParamsNames() {
     return [];
 }
-
 /** Credential fields shown in the ZAP Users panel. */
 function getCredentialsParamsNames() {
     return ["Username", "Password"];

@@ -25,7 +25,10 @@ from modules.scanner import NucleiScanner
 from modules.zap_scanner import ZapScanner
 from modules.dedup import DeduplicationEngine
 from modules.fp_filter import filter_false_positives
+from modules.finding_consolidator import consolidate_findings
+from modules.verify_filter import ReplayVerifier
 from modules.ai_analyzer import AIAnalyzer
+from modules.ai_fp_scorer import AIFalsePositiveScorer
 from modules.poc_generator import PoCGenerator
 from modules.pdf_report import PDFReportGenerator
 from modules.selenium_auth import SeleniumAuthCapture
@@ -33,6 +36,8 @@ from modules.zap_session_injector import ZapSessionInjector
 from modules.zap_context_config import ZapContextConfig
 from modules.zap_scan_orchestrator import ZapScanOrchestrator
 from modules.integrated_auth_scanner import IntegratedAuthenticatedScanner
+from modules.dep_scanner import DepScanner
+from modules.ssl_scanner import SSLScanner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("vulnforge")
@@ -67,6 +72,19 @@ class ScanRequest(BaseModel):
     generate_poc: bool = Field(default=True)
     ai_analysis: bool = Field(default=True)
     auth_config: Optional[AuthConfig] = Field(default=None, description="Authentication configuration for ZAP")
+    force_full_scan: bool = Field(default=False, description="Skip incremental URL exclusion — rescan everything")
+
+
+class ScanScheduleRequest(BaseModel):
+    target: str = Field(..., description="Target URL to scan on schedule")
+    scan_type: str = Field(default="full")
+    scanner_engine: str = Field(default="nuclei")
+    severity_filter: list[str] = Field(default=["critical", "high", "medium", "low", "info"])
+    tags: list[str] = Field(default=[])
+    generate_poc: bool = Field(default=True)
+    ai_analysis: bool = Field(default=True)
+    interval: str = Field(default="weekly", description="daily | weekly | monthly")
+    auth_config: Optional[AuthConfig] = Field(default=None)
 
 
 class ScanResponse(BaseModel):
@@ -138,14 +156,106 @@ nuclei_scanner = NucleiScanner()
 zap_scanner = ZapScanner()
 dedup = DeduplicationEngine()
 ai_analyzer = AIAnalyzer()
+ai_fp_scorer = AIFalsePositiveScorer()
 poc_gen = PoCGenerator()
 pdf_generator = PDFReportGenerator()
+dep_scanner = DepScanner()
+ssl_scanner = SSLScanner()
+
+
+def _make_replay_verifier(auth: Optional[dict], auth_status_json: Optional[str] = None) -> ReplayVerifier:
+    """Build a ReplayVerifier from the scan's auth config and/or captured session.
+
+    Priority:
+      1. Selenium-captured cookies/token stored in auth_status (most reliable —
+         these are real live session values from a browser login).
+      2. auth_config bearer token or cookie string (user-supplied static creds).
+      3. No auth (unauthenticated replay).
+    """
+    auth_cookies: dict = {}
+    auth_token:   Optional[str] = None
+    auth_headers: dict = {}
+
+    # 1. Use Selenium-captured session from auth_status if available
+    if auth_status_json:
+        try:
+            ast = json.loads(auth_status_json) if isinstance(auth_status_json, str) else auth_status_json
+            if isinstance(ast, dict):
+                # auth_status may carry cookies captured during Selenium login
+                for k, v in ast.get("cookies", {}).items():
+                    auth_cookies[k] = v
+                if ast.get("token"):
+                    auth_token = ast["token"]
+        except Exception:
+            pass
+
+    # 2. Fall back to static auth_config
+    if not auth_cookies and not auth_token and auth:
+        atype = auth.get("auth_type", "none")
+        if atype == "bearer":
+            auth_token = auth.get("token", "")
+        elif atype == "cookie":
+            for part in (auth.get("cookies") or "").split(";"):
+                if "=" in part:
+                    k, _, v = part.strip().partition("=")
+                    auth_cookies[k.strip()] = v.strip()
+        elif atype == "header":
+            name = auth.get("header_name", "")
+            val  = auth.get("header_value", "")
+            if name and val:
+                auth_headers[name] = val
+
+    return ReplayVerifier(
+        auth_cookies=auth_cookies,
+        auth_token=auth_token,
+        auth_headers=auth_headers,
+    )
 
 # New authenticated scan modules
 selenium_auth = SeleniumAuthCapture()
 zap_session_injector = ZapSessionInjector()
 zap_context_config = ZapContextConfig()
 zap_scan_orchestrator = ZapScanOrchestrator()
+
+
+async def _scheduler_loop():
+    """Background task: fire due scheduled scans every 60 seconds."""
+    INTERVAL_HOURS = {"daily": 24, "weekly": 168, "monthly": 720}
+    while True:
+        try:
+            await asyncio.sleep(60)
+            due = db.get_due_schedules()
+            for sched in due:
+                try:
+                    config = json.loads(sched["config"])
+                    req = ScanRequest(**config)
+                    new_scan_id = str(uuid.uuid4())
+                    auth_json = req.auth_config.model_dump_json() if req.auth_config else None
+                    db.create_scan(
+                        scan_id=new_scan_id, target=req.target, scan_type=req.scan_type,
+                        config=sched["config"], scanner_engine=req.scanner_engine,
+                        auth_config=auth_json,
+                    )
+                    db.update_scan(new_scan_id, parent_scan_id=sched["id"])
+                    asyncio.create_task(run_scan_pipeline(new_scan_id, req))
+
+                    # Advance next_run
+                    hours = INTERVAL_HOURS.get(sched["interval"], 168)
+                    next_run = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+                    db.update_schedule(
+                        sched["id"],
+                        last_run=datetime.now(timezone.utc).isoformat(),
+                        last_scan_id=new_scan_id,
+                        next_run=next_run,
+                    )
+                    logger.info(f"[Scheduler] Fired scan {new_scan_id} for {sched['target']} "
+                                f"(interval={sched['interval']}, next={next_run})")
+                except Exception as exc:
+                    logger.error(f"[Scheduler] Failed to launch scheduled scan {sched['id']}: {exc}")
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error(f"[Scheduler] Unexpected error: {exc}")
 
 
 @asynccontextmanager
@@ -159,7 +269,17 @@ async def lifespan(app: FastAPI):
     logger.info(f"OpenAI enabled: {ai_analyzer.enabled} (model: {ai_analyzer.model})")
     await poc_gen.initialize()
     logger.info("Playwright initialized — Vulnerability scanner ready")
+    # Pre-fetch dep scanner databases in background so first scan is fast
+    from modules.dep_db_cache import prefetch_databases
+    asyncio.create_task(prefetch_databases())
+    # Start scheduled scan background loop
+    scheduler_task = asyncio.create_task(_scheduler_loop())
     yield
+    scheduler_task.cancel()
+    try:
+        await scheduler_task
+    except asyncio.CancelledError:
+        pass
     await poc_gen.shutdown()
     logger.info("Vulnerability scanner shut down")
 
@@ -498,21 +618,58 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
 
         # Nuclei scan
         if engine in ("nuclei", "both"):
+            # ── Template update before every Nuclei scan ──────────────────────
+            db.update_scan(scan_id, phase="template_update")
+            logger.info(f"[{scan_id}] Updating Nuclei templates before scan…")
+            await nuclei_scanner.update_templates()
+
             db.update_scan(scan_id, phase="nuclei_scan")
-            logger.info(f"[{scan_id}] Running Nuclei ({request.scan_type})...")
+            logger.info(f"[{scan_id}] Running Nuclei ({request.scan_type}) with all templates…")
             try:
+                # ── Incremental: build exclude-urls file from previous crawled URLs ──
+                # Skipped when force_full_scan=True (rescan button)
+                prev_nuclei_urls = set() if request.force_full_scan else db.get_previous_crawled_urls(request.target)
+                exclude_urls_file: Optional[str] = None
+                if prev_nuclei_urls:
+                    import tempfile
+                    exclude_urls_file = tempfile.mktemp(suffix="_exclude_urls.txt")
+                    with open(exclude_urls_file, "w") as _eu:
+                        _eu.write("\n".join(prev_nuclei_urls))
+                    logger.info(f"[{scan_id}] Incremental Nuclei: excluding {len(prev_nuclei_urls)} previously scanned URLs")
+                    db.update_scan(scan_id, is_incremental="1")
+
                 nuclei_findings = await nuclei_scanner.execute(
                     target=request.target,
                     severity=request.severity_filter,
                     tags=request.tags if request.tags else None,
                     custom_templates=request.custom_templates,
                     scan_type=request.scan_type,
+                    exclude_urls_file=exclude_urls_file,
                 )
+                # Clean up temp exclude file
+                if exclude_urls_file and os.path.exists(exclude_urls_file):
+                    os.unlink(exclude_urls_file)
+
                 for f in nuclei_findings:
                     f["scanner_source"] = "nuclei"
                 all_raw_findings.extend(nuclei_findings)
                 logger.info(f"[{scan_id}] Nuclei: {len(nuclei_findings)} findings")
+
+                # Save crawled URLs (matched_at) for use by next incremental scan
+                nuclei_urls = list({
+                    f.get("matched_at") or f.get("url") or ""
+                    for f in nuclei_findings
+                    if f.get("matched_at") or f.get("url")
+                })
+                if nuclei_urls:
+                    existing_crawled = db.get_previous_crawled_urls(request.target)
+                    merged_urls = list(existing_crawled | set(nuclei_urls))
+                    db.update_scan(scan_id, crawled_urls=json.dumps(merged_urls))
+
             except Exception as e:
+                if exclude_urls_file and os.path.exists(exclude_urls_file):
+                    try: os.unlink(exclude_urls_file)
+                    except Exception: pass
                 logger.error(f"[{scan_id}] Nuclei scan failed: {e}")
                 if engine == "nuclei":
                     raise
@@ -522,9 +679,67 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
             db.update_scan(scan_id, phase="zap_scan")
             logger.info(f"[{scan_id}] Running ZAP (auth={auth.get('auth_type') if auth else 'none'})...")
             try:
+                # For form-based auth, ZAP's native form-auth is unreliable on modern apps.
+                # Use Playwright/Selenium to do the actual login, capture the session, then
+                # inject it into ZAP as cookie/bearer auth — same approach as the full
+                # authenticated scan pipeline.
+                effective_auth = auth.copy() if auth else None
+                if effective_auth and effective_auth.get("auth_type") == "form":
+                    logger.info(f"[{scan_id}] Form auth detected — running Selenium login first…")
+                    db.update_scan(scan_id, phase="selenium_login")
+                    try:
+                        from modules.selenium_auth import SeleniumAuthCapture
+                        from modules.zap_session_injector import ZapSessionInjector
+                        selenium = SeleniumAuthCapture(
+                            zap_proxy_host=os.getenv("ZAP_HOST", "zap"),
+                            zap_proxy_port=int(os.getenv("ZAP_PORT", "8080")),
+                        )
+                        session_result = await selenium.capture_session(
+                            login_url=effective_auth["login_url"],
+                            username=effective_auth.get("username"),
+                            password=effective_auth.get("password"),
+                            username_field=effective_auth.get("username_field", "username"),
+                            password_field=effective_auth.get("password_field", "password"),
+                            logged_in_indicator=effective_auth.get("logged_in_indicator"),
+                        )
+                        if session_result["success"]:
+                            logger.info(f"[{scan_id}] Selenium login OK — injecting session into ZAP")
+                            db.update_scan(scan_id, phase="zap_session_injection")
+                            injector = ZapSessionInjector(
+                                api_url=f"http://{os.getenv('ZAP_HOST','zap')}:{os.getenv('ZAP_API_PORT','8080')}",
+                                api_key=os.getenv("ZAP_API_KEY", ""),
+                            )
+                            await injector.inject_session(
+                                target_url=request.target,
+                                session_data=session_result,
+                                session_name=f"vulnforge-{scan_id[:8]}",
+                            )
+                            # Persist auth screenshot if captured
+                            if session_result.get("auth_screenshot"):
+                                db.update_scan(scan_id, auth_status=json.dumps({
+                                    "verified": session_result.get("session_valid", False),
+                                    "message": session_result.get("message", ""),
+                                    "auth_screenshot": session_result["auth_screenshot"],
+                                }))
+                            # Convert to cookie auth so ZAP uses the captured session
+                            if session_result.get("cookies"):
+                                cookie_str = "; ".join(f"{k}={v}" for k, v in session_result["cookies"].items())
+                                effective_auth = dict(effective_auth)
+                                effective_auth["auth_type"] = "cookie"
+                                effective_auth["cookies"] = cookie_str
+                            elif session_result.get("token"):
+                                effective_auth = dict(effective_auth)
+                                effective_auth["auth_type"] = "bearer"
+                                effective_auth["token"] = session_result["token"]
+                        else:
+                            logger.warning(f"[{scan_id}] Selenium login failed: {session_result.get('message')} — continuing with ZAP native form auth")
+                    except Exception as se:
+                        logger.error(f"[{scan_id}] Selenium pre-auth failed: {se} — continuing with ZAP native form auth")
+                    db.update_scan(scan_id, phase="zap_scan")
+
                 zap_findings = await zap_scanner.execute(
                     target=request.target,
-                    auth_config=auth,
+                    auth_config=effective_auth,
                     scan_type=request.scan_type,
                     severity=request.severity_filter,
                 )
@@ -536,15 +751,70 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
                 # Persist auth verification result
                 ar = zap_scanner.last_auth_result
                 if ar:
-                    db.update_scan(scan_id, auth_status=json.dumps(ar))
+                    existing_as = {}
+                    try:
+                        row = db.get_scan(scan_id)
+                        existing_as = json.loads(row.get("auth_status") or "{}") if row else {}
+                    except Exception:
+                        pass
+                    db.update_scan(scan_id, auth_status=json.dumps({**existing_as, **ar}))
                     if not ar.get("verified"):
-                        logger.warning(
-                            f"[{scan_id}] ZAP auth may have failed: {ar.get('message')}"
-                        )
+                        logger.warning(f"[{scan_id}] ZAP auth may have failed: {ar.get('message')}")
             except Exception as e:
                 logger.error(f"[{scan_id}] ZAP scan failed: {e}")
                 if engine == "zap":
                     raise
+
+        db.update_scan(scan_id, raw_finding_count=len(all_raw_findings))
+
+        # ── Phase 1b: Dependency / SCA Scan (parallel) ───────────────────────
+        # Runs concurrently with the main pipeline — page probing + Retire.js +
+        # Wappalyzer + OSV/NVD CVE lookup.  Auth cookies are passed so the dep
+        # scanner can fingerprint authenticated pages as well.
+        db.update_scan(scan_id, phase="dep_scan")
+        logger.info(f"[{scan_id}] Running dependency scan…")
+        try:
+            dep_auth_cookies: dict = {}
+            if auth:
+                atype = auth.get("auth_type", "none")
+                if atype == "cookie":
+                    for part in (auth.get("cookies") or "").split(";"):
+                        if "=" in part:
+                            k, _, v = part.strip().partition("=")
+                            dep_auth_cookies[k.strip()] = v.strip()
+            # Also pick up any Selenium-captured cookies stored in auth_status
+            try:
+                row = db.get_scan(scan_id)
+                ast = json.loads(row.get("auth_status") or "{}") if row else {}
+                dep_auth_cookies.update(ast.get("cookies", {}))
+            except Exception:
+                pass
+
+            dep_findings = await dep_scanner.scan(
+                url=request.target,
+                scan_id=scan_id,
+                auth_cookies=dep_auth_cookies or None,
+            )
+            for f in dep_findings:
+                f["scanner_source"] = "dep-scan"
+            all_raw_findings.extend(dep_findings)
+            logger.info(f"[{scan_id}] Dep scan: {len(dep_findings)} vulnerable dependency findings")
+        except Exception as dep_err:
+            logger.error(f"[{scan_id}] Dependency scan failed (non-fatal): {dep_err}")
+
+        db.update_scan(scan_id, raw_finding_count=len(all_raw_findings))
+
+        # ── Phase 1c: SSL/TLS Scan ────────────────────────────────────────────
+        db.update_scan(scan_id, phase="ssl_scan")
+        logger.info(f"[{scan_id}] Running SSL/TLS scan…")
+        try:
+            ssl_findings = await ssl_scanner.scan(target=request.target, scan_id=scan_id)
+            for f in ssl_findings:
+                f["scanner_source"] = "ssl-scan"
+            all_raw_findings.extend(ssl_findings)
+            logger.info(f"[{scan_id}] SSL scan: {len(ssl_findings)} finding(s)")
+        except Exception as ssl_err:
+            logger.error(f"[{scan_id}] SSL scan failed (non-fatal): {ssl_err}")
 
         db.update_scan(scan_id, raw_finding_count=len(all_raw_findings))
 
@@ -553,12 +823,56 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
         unique_findings = dedup.deduplicate(all_raw_findings, scan_id)
         logger.info(f"[{scan_id}] {len(unique_findings)} unique findings after dedup")
 
+        # ── Phase 2a: Consolidation ───────────────────────────────────────────
+        # Group findings that share the same vulnerability class on the same host
+        # (same template_id / name / CVE across multiple URLs) into one
+        # representative finding with a vulnerable_urls list.
+        # Groups smaller than 3 pass through unchanged.
+        db.update_scan(scan_id, phase="consolidation")
+        try:
+            unique_findings, savings = consolidate_findings(unique_findings)
+            if savings:
+                logger.info(
+                    f"[{scan_id}] Consolidation: {savings} findings collapsed "
+                    f"→ {len(unique_findings)} after grouping"
+                )
+        except Exception as con_err:
+            logger.error(f"[{scan_id}] Consolidation failed (non-fatal): {con_err}")
+
         # ── Phase 2b: Rule-Based False-Positive Filter ───────────────────────
         db.update_scan(scan_id, phase="fp_filtering")
         unique_findings, fp_findings = filter_false_positives(unique_findings)
         if fp_findings:
             logger.info(
                 f"[{scan_id}] FP filter: {len(fp_findings)} removed, "
+                f"{len(unique_findings)} retained"
+            )
+
+        # ── Phase 2c: HTTP Replay Verification ───────────────────────────────
+        # Re-send each injection finding's original attack request and check
+        # if the evidence still appears in the response.
+        # Uses the live session (cookies/token) for authenticated scans so
+        # the replayed request hits the same auth-protected endpoints as the scan.
+        db.update_scan(scan_id, phase="fp_filtering")
+        try:
+            scan_row = db.get_scan(scan_id)
+            auth_status_json = scan_row.get("auth_status") if scan_row else None
+            verifier = _make_replay_verifier(auth, auth_status_json)
+            unique_findings, unverified = await verifier.verify(unique_findings)
+            if unverified:
+                logger.info(
+                    f"[{scan_id}] Replay: {len(unverified)} transient FPs removed, "
+                    f"{len(unique_findings)} confirmed"
+                )
+        except Exception as re_err:
+            logger.error(f"[{scan_id}] Replay verification failed (non-fatal): {re_err}")
+
+        # ── Phase 2d: AI-Assisted FP Scoring (low/medium confidence ZAP) ─────
+        db.update_scan(scan_id, phase="ai_fp_scoring")
+        unique_findings, ai_fp_findings = await ai_fp_scorer.score(unique_findings)
+        if ai_fp_findings:
+            logger.info(
+                f"[{scan_id}] AI-FP scorer: {len(ai_fp_findings)} removed, "
                 f"{len(unique_findings)} retained"
             )
 
@@ -591,7 +905,27 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
         # ── Phase 5: Evidence Capture (steps + screenshot) ────────────────────
         if request.generate_poc and unique_findings:
             db.update_scan(scan_id, phase="evidence_capture")
-            semaphore = asyncio.Semaphore(5)  # max 5 concurrent tasks
+            # Raised to 8 — matches context pool size; all ops are I/O-bound
+            semaphore = asyncio.Semaphore(8)
+            # Inner semaphore for per-instance screenshots inside a group slot
+            inst_semaphore = asyncio.Semaphore(3)
+            # Hard cap per screenshot so a hung page never blocks a slot forever
+            SCREENSHOT_TIMEOUT = 12  # seconds
+
+            async def _take_screenshot(url: str, path: str, f: dict) -> bool:
+                """Take one screenshot with a hard timeout. Returns True on success."""
+                try:
+                    await asyncio.wait_for(
+                        poc_gen._capture_screenshot(url, path, finding=f),
+                        timeout=SCREENSHOT_TIMEOUT,
+                    )
+                    return os.path.exists(path)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{scan_id}] Screenshot timed out after {SCREENSHOT_TIMEOUT}s: {url[:70]}")
+                    return False
+                except Exception as e:
+                    logger.warning(f"[{scan_id}] Screenshot failed for {url[:70]}: {e}")
+                    return False
 
             async def _run_poc(finding: dict):
                 async with semaphore:
@@ -599,17 +933,14 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
                         url = finding.get("matched_at") or finding.get("url") or finding.get("host", "")
                         screenshot_path = os.path.join("screenshots", f"{finding['id']}.png")
 
-                        # Take screenshot
+                        # Primary screenshot
                         if poc_gen._browser and url:
-                            try:
-                                await poc_gen._capture_screenshot(url, screenshot_path)
-                            except Exception as e:
-                                logger.warning(f"[{scan_id}] Screenshot failed for {url}: {e}")
+                            await _take_screenshot(url, screenshot_path, finding)
 
                         # Build template-based steps (no AI, always works)
                         steps = _build_template_steps(finding)
 
-                        # Preserve any existing extracted_results (e.g. consolidated URLs)
+                        # Preserve any existing extracted_results
                         existing = {}
                         if finding.get("extracted_results"):
                             try:
@@ -619,23 +950,24 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
                             except (json.JSONDecodeError, TypeError):
                                 pass
 
-                        # For consolidated groups: also capture a screenshot per URL
+                        # Per-instance screenshots for consolidated groups — run in parallel
                         instance_screenshots = []
-                        if existing.get("is_consolidated_group"):
-                            for inst_url in existing.get("vulnerable_urls", [])[:5]:
-                                inst_shot = os.path.join(
-                                    "screenshots",
-                                    f"{finding['id']}_{abs(hash(inst_url)) % 100000}.png",
-                                )
-                                try:
-                                    await poc_gen._capture_screenshot(inst_url, inst_shot)
-                                    if os.path.exists(inst_shot):
-                                        instance_screenshots.append({
-                                            "url": inst_url,
-                                            "screenshot": inst_shot,
-                                        })
-                                except Exception:
-                                    pass
+                        if existing.get("is_consolidated_group") and poc_gen._browser:
+                            inst_urls = existing.get("vulnerable_urls", [])[:5]
+
+                            async def _inst_shot(inst_url: str):
+                                async with inst_semaphore:
+                                    inst_shot = os.path.join(
+                                        "screenshots",
+                                        f"{finding['id']}_{abs(hash(inst_url)) % 100000}.png",
+                                    )
+                                    ok = await _take_screenshot(inst_url, inst_shot, finding)
+                                    if ok:
+                                        return {"url": inst_url, "screenshot": inst_shot}
+                                    return None
+
+                            inst_results = await asyncio.gather(*[_inst_shot(u) for u in inst_urls])
+                            instance_screenshots = [r for r in inst_results if r]
 
                         existing["steps_to_reproduce"] = steps
                         if instance_screenshots:
@@ -795,7 +1127,10 @@ async def create_authenticated_scan(request: AuthenticatedScanRequest, backgroun
 
 
 @app.get("/api/scans")
-async def list_scans(limit: int = Query(50, le=200), offset: int = Query(0, ge=0), status: Optional[str] = None):
+async def list_scans(limit: int = Query(50, le=200), offset: int = Query(0, ge=0),
+                     status: Optional[str] = None, target: Optional[str] = None):
+    if target:
+        return db.get_scans_by_target(target, limit=limit)
     return db.get_scans(limit=limit, offset=offset, status=status)
 
 @app.get("/api/scans/{scan_id}")
@@ -805,19 +1140,155 @@ async def get_scan(scan_id: str):
         raise HTTPException(404, "Scan not found")
     return scan
 
+@app.get("/api/scans/{scan_id}/progress/stream")
+async def stream_scan_progress(scan_id: str):
+    """
+    Server-Sent Events (SSE) stream that pushes real-time scan phase updates to the browser.
+    Emits a JSON event every 2 seconds until the scan reaches 'completed' or 'failed'.
+    """
+    async def event_generator():
+        try:
+            while True:
+                scan = db.get_scan(scan_id)
+                if not scan:
+                    yield f"data: {json.dumps({'error': 'Scan not found'})}\n\n"
+                    break
+
+                payload = {
+                    "scan_id": scan_id,
+                    "status": scan["status"],
+                    "phase": scan.get("phase", "initializing"),
+                    "raw_finding_count": scan.get("raw_finding_count", 0),
+                    "unique_finding_count": scan.get("unique_finding_count", 0),
+                    "error": scan.get("error"),
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+
+                if scan["status"] in ("completed", "failed"):
+                    break
+
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            pass  # Client disconnected
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
 @app.delete("/api/scans/{scan_id}")
 async def delete_scan(scan_id: str):
     db.delete_scan(scan_id)
     return {"message": "Scan deleted"}
 
+
+@app.post("/api/scans/{scan_id}/rescan", response_model=ScanResponse, status_code=201)
+async def rescan(scan_id: str, background_tasks: BackgroundTasks):
+    """Re-run a scan using the original configuration (full rescan — incremental is skipped)."""
+    original = db.get_scan(scan_id)
+    if not original:
+        raise HTTPException(404, "Scan not found")
+    try:
+        config_dict = json.loads(original["config"])
+        # Always force a full rescan — do not skip any URLs from previous runs
+        config_dict["force_full_scan"] = True
+        request = ScanRequest(**config_dict)
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse original scan config: {e}")
+    new_id = str(uuid.uuid4())
+    auth_json = request.auth_config.model_dump_json() if request.auth_config else None
+    db.create_scan(
+        scan_id=new_id, target=request.target, scan_type=request.scan_type,
+        config=request.model_dump_json(), scanner_engine=request.scanner_engine,
+        auth_config=auth_json,
+    )
+    db.update_scan(new_id, parent_scan_id=scan_id)
+    background_tasks.add_task(run_scan_pipeline, new_id, request)
+    return ScanResponse(scan_id=new_id, status="queued",
+                        message=f"Full rescan queued for {request.target} (parent: {scan_id})")
+
+
+@app.get("/api/targets")
+async def list_targets():
+    """Return each unique scanned target with scan counts."""
+    return db.get_distinct_targets()
+
+
+@app.get("/api/targets/{target:path}/history")
+async def get_target_history(target: str, limit: int = Query(20, le=100)):
+    """Return all scans for a specific target, newest first."""
+    return db.get_scans_by_target(target, limit=limit)
+
+
+# ── Schedule endpoints ────────────────────────────────────────────────────────
+
+@app.get("/api/schedules")
+async def list_schedules():
+    return db.get_schedules()
+
+
+@app.post("/api/schedules", status_code=201)
+async def create_schedule(request: ScanScheduleRequest):
+    INTERVAL_HOURS = {"daily": 24, "weekly": 168, "monthly": 720}
+    hours = INTERVAL_HOURS.get(request.interval, 168)
+    next_run = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    sched_id = str(uuid.uuid4())
+    # Store a ScanRequest-compatible config (drop interval field)
+    scan_cfg = ScanRequest(
+        target=request.target, scan_type=request.scan_type,
+        scanner_engine=request.scanner_engine, severity_filter=request.severity_filter,
+        tags=request.tags, generate_poc=request.generate_poc,
+        ai_analysis=request.ai_analysis, auth_config=request.auth_config,
+    )
+    db.create_schedule(
+        schedule_id=sched_id, target=request.target,
+        config=scan_cfg.model_dump_json(), interval=request.interval, next_run=next_run,
+    )
+    return db.get_schedule(sched_id)
+
+
+@app.patch("/api/schedules/{schedule_id}")
+async def update_schedule(schedule_id: str, enabled: Optional[bool] = None,
+                          interval: Optional[str] = None):
+    sched = db.get_schedule(schedule_id)
+    if not sched:
+        raise HTTPException(404, "Schedule not found")
+    updates = {}
+    if enabled is not None:
+        updates["enabled"] = 1 if enabled else 0
+    if interval:
+        INTERVAL_HOURS = {"daily": 24, "weekly": 168, "monthly": 720}
+        hours = INTERVAL_HOURS.get(interval, 168)
+        updates["interval"] = interval
+        updates["next_run"] = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    if updates:
+        db.update_schedule(schedule_id, **updates)
+    return db.get_schedule(schedule_id)
+
+
+@app.delete("/api/schedules/{schedule_id}")
+async def delete_schedule(schedule_id: str):
+    if not db.get_schedule(schedule_id):
+        raise HTTPException(404, "Schedule not found")
+    db.delete_schedule(schedule_id)
+    return {"message": "Schedule deleted"}
+
+
 @app.get("/api/scans/{scan_id}/findings")
-async def get_scan_findings(scan_id: str, severity: Optional[str] = None, status: Optional[str] = None):
-    return db.get_findings(scan_id=scan_id, severity=severity, status=status)
+async def get_scan_findings(scan_id: str, severity: Optional[str] = None, status: Optional[str] = None, scanner_source: Optional[str] = None, limit: int = Query(500, le=2000)):
+    return db.get_findings(scan_id=scan_id, severity=severity, status=status, scanner_source=scanner_source, limit=limit)
 
 @app.get("/api/findings")
 async def list_findings(severity: Optional[str] = None, status: Optional[str] = None,
+                        scanner_source: Optional[str] = None,
                         limit: int = Query(100, le=500), offset: int = Query(0, ge=0)):
-    return db.get_findings(severity=severity, status=status, limit=limit, offset=offset)
+    return db.get_findings(severity=severity, status=status, scanner_source=scanner_source, limit=limit, offset=offset)
 
 @app.get("/api/findings/{finding_id}")
 async def get_finding(finding_id: str):
@@ -1197,7 +1668,13 @@ async def run_authenticated_scan_pipeline(
             )
             return
 
-        db.update_scan(scan_id, auth_status=json.dumps(session_result))
+        db.update_scan(scan_id, auth_status=json.dumps({
+            "verified": session_result.get("success", False),
+            "message": session_result.get("message", ""),
+            "auth_type": session_result.get("auth_type"),
+            "cookies_captured": len(session_result.get("cookies") or {}),
+            "auth_screenshot": session_result.get("auth_screenshot"),
+        }))
         logger.info(f"[Auth Scan] ✓ Session captured: {session_result['auth_type']}")
 
         # Step 2: Inject session into ZAP
@@ -1241,6 +1718,23 @@ async def run_authenticated_scan_pipeline(
         logger.info(f"[Auth Scan] Phase 4: Running authenticated scan")
         db.update_scan(scan_id, status="scanning", phase="zap_spider")
 
+        # Build re-auth config so the orchestrator can re-login if the session expires mid-scan
+        reauth_config = {
+            "login_url": request.login_url,
+            "username": request.username,
+            "password": request.password,
+            "username_field": request.username_field,
+            "password_field": request.password_field,
+            "logged_in_indicator": request.logged_in_indicator,
+        }
+
+        # Fetch crawled URLs from the previous scan of this target for incremental mode
+        previous_urls = db.get_previous_crawled_urls(request.target)
+        if previous_urls:
+            logger.info(
+                f"[Auth Scan] Incremental mode: {len(previous_urls)} known URLs from previous scan of {request.target}"
+            )
+
         zap_orchestrator = ZapScanOrchestrator()
         scan_result = await zap_orchestrator.run_authenticated_scan(
             target_url=request.target,
@@ -1248,6 +1742,8 @@ async def run_authenticated_scan_pipeline(
             scan_type=request.scan_type,
             timeout_minutes=request.timeout_minutes,
             logged_in_indicator=request.logged_in_indicator,
+            reauth_config=reauth_config,
+            previous_urls=previous_urls if previous_urls else None,
         )
 
         if not scan_result["success"]:
@@ -1286,6 +1782,28 @@ async def run_authenticated_scan_pipeline(
         db.update_scan(scan_id, phase="fp_filtering")
         unique_findings, _fp = filter_false_positives(unique_findings)
 
+        # HTTP Replay Verification — re-send attack requests with the live session
+        try:
+            scan_row = db.get_scan(scan_id)
+            verifier = _make_replay_verifier(
+                auth=None,
+                auth_status_json=scan_row.get("auth_status") if scan_row else None,
+            )
+            unique_findings, _unverified = await verifier.verify(unique_findings)
+            if _unverified:
+                logger.info(f"[Auth Scan] Replay: {len(_unverified)} transient FPs removed")
+        except Exception as re_err:
+            logger.error(f"[Auth Scan] Replay verification failed (non-fatal): {re_err}")
+
+        # AI-assisted FP scoring (low/medium confidence ZAP findings)
+        db.update_scan(scan_id, phase="ai_fp_scoring")
+        unique_findings, ai_fp_findings = await ai_fp_scorer.score(unique_findings)
+        if ai_fp_findings:
+            logger.info(
+                f"[Auth Scan] AI-FP scorer: {len(ai_fp_findings)} removed, "
+                f"{len(unique_findings)} retained"
+            )
+
         # Store findings
         db.update_scan(scan_id, phase="storing_findings")
         for finding in unique_findings:
@@ -1313,15 +1831,22 @@ async def run_authenticated_scan_pipeline(
             db.update_scan(scan_id, phase="evidence_capture")
             # Similar to regular scan pipeline...
 
+        # Persist crawled URL list for use by the next incremental scan of this target
+        crawled_urls = scan_result.get("crawled_urls", [])
         db.update_scan(
             scan_id,
-            status="complete",
+            status="completed",
             phase="done",
             raw_finding_count=len(findings),
             unique_finding_count=len(unique_findings),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+            crawled_urls=json.dumps(crawled_urls) if crawled_urls else None,
         )
 
-        logger.info(f"[Auth Scan] ✓ Pipeline completed for {scan_id}")
+        logger.info(
+            f"[Auth Scan] ✓ Pipeline completed for {scan_id} "
+            f"(stored {len(crawled_urls)} crawled URLs for incremental re-scan)"
+        )
 
     except Exception as e:
         logger.error(f"[Auth Scan] Pipeline failed: {e}", exc_info=True)
@@ -1471,20 +1996,35 @@ async def run_integrated_auth_scan_pipeline(
             "message": session_result.get("message", "Session capture attempted"),
             "auth_type": session_result.get("auth_type", "unknown"),
             "cookies_captured": cookies_captured,
+            "auth_screenshot": session_result.get("auth_screenshot"),
         })
         db.update_scan(scan_id, auth_status=auth_status_json)
 
         # ── Phase 3: Inject session into ZAP via Replacer API ─────────────────
         logger.info(f"[{scan_id}] Phase 3: Injecting session into ZAP")
         async with _httpx.AsyncClient(timeout=15.0) as client:
-            # Remove stale replacer rules first (best-effort)
-            try:
-                await client.get(
-                    f"{zap_api_url}/JSON/replacer/action/removeRule/",
-                    params={"apikey": zap_api_key, "description": f"auth-cookies-{scan_id}"},
-                )
-            except Exception:
-                pass
+            # Fetch existing replacer rule descriptions so we only remove rules that exist
+            async def _get_replacer_rule_descriptions(c) -> set:
+                try:
+                    resp = await c.get(
+                        f"{zap_api_url}/JSON/replacer/view/rules/",
+                        params={"apikey": zap_api_key},
+                    )
+                    return {r.get("description", "") for r in resp.json().get("rules", [])}
+                except Exception:
+                    return set()
+
+            # Remove stale replacer rules first (best-effort, only if they exist)
+            existing_rules = await _get_replacer_rule_descriptions(client)
+            stale_desc = f"auth-cookies-{scan_id}"
+            if stale_desc in existing_rules:
+                try:
+                    await client.get(
+                        f"{zap_api_url}/JSON/replacer/action/removeRule/",
+                        params={"apikey": zap_api_key, "description": stale_desc},
+                    )
+                except Exception:
+                    pass
 
             # Build cookie string from the {name: value} dict
             cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items() if k and v)
@@ -1589,8 +2129,20 @@ async def run_integrated_auth_scan_pipeline(
             raw_alerts = r.json().get("alerts", [])
             logger.info(f"[{scan_id}] ZAP returned {len(raw_alerts)} alerts")
 
-            # Clean up replacer rules
+            # Clean up replacer rules (only remove rules that actually exist)
+            try:
+                existing_cleanup = {
+                    r.get("description", "")
+                    for r in (await client.get(
+                        f"{zap_api_url}/JSON/replacer/view/rules/",
+                        params={"apikey": zap_api_key},
+                    )).json().get("rules", [])
+                }
+            except Exception:
+                existing_cleanup = set()
             for desc in [f"auth-cookies-{scan_id}", f"auth-bearer-{scan_id}"]:
+                if desc not in existing_cleanup:
+                    continue
                 try:
                     await client.get(f"{zap_api_url}/JSON/replacer/action/removeRule/",
                                       params={"apikey": zap_api_key, "description": desc})
@@ -1616,6 +2168,15 @@ async def run_integrated_auth_scan_pipeline(
 
         db.update_scan(scan_id, phase="fp_filtering")
         unique_findings, _fp = filter_false_positives(unique_findings)
+
+        # AI-assisted FP scoring (low/medium confidence ZAP findings)
+        db.update_scan(scan_id, phase="ai_fp_scoring")
+        unique_findings, ai_fp_findings = await ai_fp_scorer.score(unique_findings)
+        if ai_fp_findings:
+            logger.info(
+                f"[{scan_id}] AI-FP scorer: {len(ai_fp_findings)} removed, "
+                f"{len(unique_findings)} retained"
+            )
 
         # ── Fetch HTTP request/response from ZAP for unique findings ──────────
         logger.info(f"[{scan_id}] Fetching HTTP messages for {len(unique_findings)} unique findings")
@@ -1643,6 +2204,20 @@ async def run_integrated_auth_scan_pipeline(
                 except Exception as e:
                     logger.debug(f"[{scan_id}] HTTP message fetch failed for msg {msg_id}: {e}")
                     finding.pop("_zap_message_id", None)
+
+        # ── HTTP Replay Verification (runs after http_request is populated) ──
+        # http_request is now filled above — replay can use the exact raw request.
+        try:
+            scan_row = db.get_scan(scan_id)
+            verifier = _make_replay_verifier(
+                auth=None,
+                auth_status_json=scan_row.get("auth_status") if scan_row else None,
+            )
+            unique_findings, _unverified = await verifier.verify(unique_findings)
+            if _unverified:
+                logger.info(f"[{scan_id}] Replay: {len(_unverified)} transient FPs removed")
+        except Exception as re_err:
+            logger.error(f"[{scan_id}] Replay verification failed (non-fatal): {re_err}")
 
         db.update_scan(scan_id, unique_finding_count=len(unique_findings), phase="storing_findings")
         for finding in unique_findings:
@@ -1678,7 +2253,7 @@ async def run_integrated_auth_scan_pipeline(
                         screenshot_path = os.path.join("screenshots", f"{finding['id']}.png")
                         if poc_gen._browser and url:
                             try:
-                                await poc_gen._capture_screenshot(url, screenshot_path)
+                                await poc_gen._capture_screenshot(url, screenshot_path, finding=finding)
                             except Exception as e:
                                 logger.warning(f"[{scan_id}] Screenshot failed for {url}: {e}")
 
