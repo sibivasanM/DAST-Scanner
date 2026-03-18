@@ -260,7 +260,7 @@ class ZapSessionInjector:
 
             # Make request through ZAP proxy
             async with httpx.AsyncClient(
-                proxies=f"http://localhost:8080",
+                proxies=self.api_url,
                 verify=False,
                 timeout=10.0,
             ) as proxy_client:

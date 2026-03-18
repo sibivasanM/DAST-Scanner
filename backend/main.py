@@ -4,15 +4,17 @@ Core API Server — Nuclei + ZAP authenticated scanning, OpenAI GPT-4o analysis
 """
 
 import asyncio
+import ipaddress
 import json
 import logging
 import os
 import re
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,8 +41,48 @@ from modules.integrated_auth_scanner import IntegratedAuthenticatedScanner
 from modules.dep_scanner import DepScanner
 from modules.ssl_scanner import SSLScanner
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
 logger = logging.getLogger("vulnforge")
+
+# ── Private/reserved IP ranges blocked for SSRF protection ───────────────────
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+]
+
+def _is_private_ip(hostname: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return any(addr in net for net in _BLOCKED_NETWORKS)
+    except ValueError:
+        return False
+
+def validate_scan_target(target: str) -> None:
+    """Raise HTTPException if target is a private/reserved address (SSRF guard)."""
+    if not target or not target.strip():
+        raise HTTPException(400, "Target URL is required")
+    # Allow non-URL targets (hostnames) — parse only if scheme present
+    url = target if "://" in target else f"https://{target}"
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+    except Exception:
+        raise HTTPException(400, f"Invalid target URL: {target}")
+    blocked_hostnames = {"localhost", "metadata.google.internal", "169.254.169.254"}
+    if hostname.lower() in blocked_hostnames or _is_private_ip(hostname):
+        raise HTTPException(400, f"Target '{hostname}' resolves to a private/reserved address")
+
+# ── Scan concurrency limiter ──────────────────────────────────────────────────
+_MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "5"))
+_scan_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SCANS)
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -151,7 +193,9 @@ class AuthenticatedScanOrchestrationRequest(BaseModel):
 
 # ── Application Lifecycle ────────────────────────────────────────────────────
 
-db = Database()
+_db_path = os.getenv("DATABASE_PATH", "vulnforge.db")
+os.makedirs(os.path.dirname(_db_path) if os.path.dirname(_db_path) else ".", exist_ok=True)
+db = Database(_db_path)
 nuclei_scanner = NucleiScanner()
 zap_scanner = ZapScanner()
 dedup = DeduplicationEngine()
@@ -290,8 +334,18 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
+_cors_origins_raw = os.getenv("CORS_ALLOWED_ORIGINS", "*")
+_cors_origins = (
+    ["*"] if _cors_origins_raw.strip() == "*"
+    else [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_origins_raw.strip() != "*",
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+)
 
 os.makedirs("screenshots", exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory="screenshots"), name="screenshots")
@@ -607,6 +661,7 @@ def _build_template_steps(finding: dict) -> dict:
 
 async def run_scan_pipeline(scan_id: str, request: ScanRequest):
     """Pipeline: Nuclei/ZAP/Both → Dedup → Store → AI → Steps + Screenshot"""
+    await _scan_semaphore.acquire()
     try:
         engine = request.scanner_engine
         auth = request.auth_config.model_dump() if request.auth_config else None
@@ -618,10 +673,11 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
 
         # Nuclei scan
         if engine in ("nuclei", "both"):
-            # ── Template update before every Nuclei scan ──────────────────────
-            db.update_scan(scan_id, phase="template_update")
-            logger.info(f"[{scan_id}] Updating Nuclei templates before scan…")
-            await nuclei_scanner.update_templates()
+            # ── Template update (skip if NUCLEI_AUTO_UPDATE=false) ────────────
+            if os.getenv("NUCLEI_AUTO_UPDATE", "true").lower() != "false":
+                db.update_scan(scan_id, phase="template_update")
+                logger.info(f"[{scan_id}] Updating Nuclei templates before scan…")
+                await nuclei_scanner.update_templates()
 
             db.update_scan(scan_id, phase="nuclei_scan")
             logger.info(f"[{scan_id}] Running Nuclei ({request.scan_type}) with all templates…")
@@ -800,7 +856,7 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
             all_raw_findings.extend(dep_findings)
             logger.info(f"[{scan_id}] Dep scan: {len(dep_findings)} vulnerable dependency findings")
         except Exception as dep_err:
-            logger.error(f"[{scan_id}] Dependency scan failed (non-fatal): {dep_err}")
+            logger.error(f"[{scan_id}] Dependency scan failed (non-fatal)", exc_info=True)
 
         db.update_scan(scan_id, raw_finding_count=len(all_raw_findings))
 
@@ -814,7 +870,7 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
             all_raw_findings.extend(ssl_findings)
             logger.info(f"[{scan_id}] SSL scan: {len(ssl_findings)} finding(s)")
         except Exception as ssl_err:
-            logger.error(f"[{scan_id}] SSL scan failed (non-fatal): {ssl_err}")
+            logger.error(f"[{scan_id}] SSL scan failed (non-fatal)", exc_info=True)
 
         db.update_scan(scan_id, raw_finding_count=len(all_raw_findings))
 
@@ -990,15 +1046,17 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
         logger.info(f"[{scan_id}] ✓ Complete — {len(unique_findings)} findings for {request.target}")
 
     except Exception as e:
-        tb = traceback.format_exc()
-        logger.error(f"[{scan_id}] FAILED: {e}\n{tb}")
+        logger.error(f"[{scan_id}] FAILED: {e}", exc_info=True)
         db.update_scan(scan_id, status="failed", phase="error", error=f"{type(e).__name__}: {e}")
+    finally:
+        _scan_semaphore.release()
 
 
 # ── API Routes ───────────────────────────────────────────────────────────────
 
 @app.post("/api/scans", response_model=ScanResponse, status_code=201)
 async def create_scan(request: ScanRequest, background_tasks: BackgroundTasks):
+    validate_scan_target(request.target)
     scan_id = str(uuid.uuid4())
     auth_json = request.auth_config.model_dump_json() if request.auth_config else None
     db.create_scan(
@@ -1322,14 +1380,18 @@ async def attack_surface():
 async def health():
     nuclei_ok = await nuclei_scanner.check_health()
     zap_ok = await zap_scanner.check_health()
+    active_scans = len([1 for _ in range(_MAX_CONCURRENT_SCANS - _scan_semaphore._value)])
+    status = "healthy" if nuclei_ok else "degraded"
     return {
-        "status": "healthy",
+        "status": status,
         "nuclei_available": nuclei_ok,
         "zap_available": zap_ok,
         "zap_url": zap_scanner.api_url,
         "ai_provider": "openai",
         "ai_model": ai_analyzer.model,
         "ai_enabled": ai_analyzer.enabled,
+        "active_scans": active_scans,
+        "max_concurrent_scans": _MAX_CONCURRENT_SCANS,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

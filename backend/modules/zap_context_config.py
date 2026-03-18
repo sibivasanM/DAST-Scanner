@@ -288,7 +288,7 @@ class ZapContextConfig:
 
             # Make test request through ZAP assuming the context is active
             async with httpx.AsyncClient(
-                proxies="http://localhost:8080",
+                proxies=self.api_url,
                 verify=False,
                 timeout=10.0,
             ) as proxy_client:

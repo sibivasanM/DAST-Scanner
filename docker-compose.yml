@@ -5,25 +5,31 @@ services:
     image: ghcr.io/zaproxy/zaproxy:stable
     command: >
       zap.sh -daemon -host 0.0.0.0 -port 8080
-      -config api.key=vulnforge-zap-key
+      -config api.key=${ZAP_API_KEY:-vulnforge-zap-key}
       -config api.addrs.addr.name=.*
       -config api.addrs.addr.regex=true
       -config api.disablekey=false
       -config connection.timeoutInSecs=120
-      -config spider.maxDuration=5
-      -config scanner.maxScanDurationInMins=60
+      -config spider.maxDuration=${ZAP_SPIDER_DURATION:-10}
+      -config scanner.maxScanDurationInMins=${ZAP_SCAN_DURATION:-60}
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - zap-data:/zap/wrk
       - zap-scripts:/zap/scripts/vulnforge
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/JSON/core/view/version/?apikey=vulnforge-zap-key"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/JSON/core/view/version/?apikey=${ZAP_API_KEY:-vulnforge-zap-key}"]
       interval: 15s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 60s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
 
   # ── Backend API ─────────────────────────────────────────────────────────────
   backend:
@@ -32,18 +38,23 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
       - ZAP_API_URL=http://zap:8080
-      - ZAP_API_KEY=vulnforge-zap-key
+      - ZAP_API_KEY=${ZAP_API_KEY:-vulnforge-zap-key}
+      - ZAP_HOST=zap
       - PYTHONUNBUFFERED=1
+      - MAX_CONCURRENT_SCANS=${MAX_CONCURRENT_SCANS:-3}
+      - NUCLEI_AUTO_UPDATE=${NUCLEI_AUTO_UPDATE:-true}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
+      - DATABASE_PATH=/app/data/vulnforge.db
     volumes:
       - scan-data:/app/data
       - screenshots:/app/screenshots
       - zap-scripts:/app/zap-scripts
-      - ./selinium:/app/selinium
+      - ./selenium:/app/selenium
     depends_on:
       zap:
         condition: service_healthy
@@ -52,7 +63,14 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
 
   # ── Frontend ────────────────────────────────────────────────────────────────
   frontend:
@@ -61,13 +79,22 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:80"
+      - "0.0.0.0:3000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
 
 volumes:
   scan-data:
+    driver: local
   screenshots:
+    driver: local
   zap-data:
+    driver: local
   zap-scripts:
+    driver: local

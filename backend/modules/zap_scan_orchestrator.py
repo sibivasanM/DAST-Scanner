@@ -444,7 +444,7 @@ class ZapScanOrchestrator:
 
             # Make a simple request to check indicator
             async with httpx.AsyncClient(
-                proxies="http://localhost:8080",
+                proxies=self.api_url,
                 verify=False,
                 timeout=5.0,
             ) as proxy_client:

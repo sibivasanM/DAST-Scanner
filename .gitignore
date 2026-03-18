@@ -12,13 +12,26 @@ dist/
 
 # Database
 *.db
+*.db-wal
+*.db-shm
 
-# Environment
+# Environment — NEVER commit these
 .env
+.env.local
+.env.production
+.env.staging
 
 # Screenshots
 screenshots/*.png
+screenshots/*.jpg
+
+# Scan data
+data/
 
 # IDE
 .vscode/
 .idea/
+
+# Logs
+*.log
+logs/
