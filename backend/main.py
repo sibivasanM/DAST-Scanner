@@ -706,7 +706,7 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
                             logger.info(f"[{scan_id}] Selenium login OK — injecting session into ZAP")
                             db.update_scan(scan_id, phase="zap_session_injection")
                             injector = ZapSessionInjector(
-                                api_url=f"http://{os.getenv('ZAP_HOST','zap')}:{os.getenv('ZAP_API_PORT','8080')}",
+                                api_url=os.getenv("ZAP_API_URL", "http://localhost:8080"),
                                 api_key=os.getenv("ZAP_API_KEY", ""),
                             )
                             await injector.inject_session(

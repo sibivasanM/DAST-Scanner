@@ -25,7 +25,7 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vulnforge.zap")
 
-ZAP_API_URL = os.getenv("ZAP_API_URL", "http://zap:8080")
+ZAP_API_URL = os.getenv("ZAP_API_URL", "http://localhost:8080")
 ZAP_API_KEY = os.getenv("ZAP_API_KEY", "vulnforge-zap-key")
 
 # Map ZAP risk codes to our severity levels
