@@ -3,6 +3,11 @@ services:
   zap:
     container_name: vulnerability-scanner-zap
     image: ghcr.io/zaproxy/zaproxy:stable
+    environment:
+      # ZAP's startup script reads host RAM via `free -m` and ignores Docker limits.
+      # _JAVA_OPTIONS is picked up by the JVM launcher itself before zap.sh runs,
+      # so it wins over the script's auto-calculated -Xmx.
+      - "_JAVA_OPTIONS=-Xmx${ZAP_HEAP_MB:-700}m -Xms128m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -XX:+UseContainerSupport"
     command: >
       zap.sh -daemon -host 0.0.0.0 -port 8080
       -config api.key=${ZAP_API_KEY:-vulnforge-zap-key}
@@ -21,15 +26,19 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/JSON/core/view/version/?apikey=${ZAP_API_KEY:-vulnforge-zap-key}"]
       interval: 15s
       timeout: 5s
-      retries: 10
-      start_period: 60s
+      retries: 12
+      start_period: 90s
     restart: unless-stopped
+    # mem_limit works in non-swarm compose; deploy.resources is for swarm.
+    # Both set for maximum compatibility.
+    mem_limit: ${ZAP_MEMORY_LIMIT:-1200m}
+    memswap_limit: ${ZAP_MEMORY_LIMIT:-1200m}
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: ${ZAP_MEMORY_LIMIT:-1200m}
         reservations:
-          memory: 512M
+          memory: 256M
 
   # ── Backend API ─────────────────────────────────────────────────────────────
   backend:
@@ -65,12 +74,14 @@ services:
       retries: 3
       start_period: 20s
     restart: unless-stopped
+    mem_limit: ${BACKEND_MEMORY_LIMIT:-2G}
+    memswap_limit: ${BACKEND_MEMORY_LIMIT:-2G}
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: ${BACKEND_MEMORY_LIMIT:-2G}
         reservations:
-          memory: 1G
+          memory: 512M
 
   # ── Frontend ────────────────────────────────────────────────────────────────
   frontend:
@@ -84,6 +95,8 @@ services:
       backend:
         condition: service_healthy
     restart: unless-stopped
+    mem_limit: 256m
+    memswap_limit: 256m
     deploy:
       resources:
         limits:

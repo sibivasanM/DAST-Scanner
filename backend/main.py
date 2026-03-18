@@ -728,100 +728,111 @@ async def run_scan_pipeline(scan_id: str, request: ScanRequest):
                 if exclude_urls_file and os.path.exists(exclude_urls_file):
                     try: os.unlink(exclude_urls_file)
                     except Exception: pass
-                logger.error(f"[{scan_id}] Nuclei scan failed: {e}")
-                if engine == "nuclei":
-                    raise
+                logger.error(f"[{scan_id}] Nuclei scan failed: {e}", exc_info=True)
+                # Continue — dep/SSL scans may still produce findings
 
         # ZAP scan
         if engine in ("zap", "both"):
             db.update_scan(scan_id, phase="zap_scan")
             logger.info(f"[{scan_id}] Running ZAP (auth={auth.get('auth_type') if auth else 'none'})...")
-            try:
-                # For form-based auth, ZAP's native form-auth is unreliable on modern apps.
-                # Use Playwright/Selenium to do the actual login, capture the session, then
-                # inject it into ZAP as cookie/bearer auth — same approach as the full
-                # authenticated scan pipeline.
-                effective_auth = auth.copy() if auth else None
-                if effective_auth and effective_auth.get("auth_type") == "form":
-                    logger.info(f"[{scan_id}] Form auth detected — running Selenium login first…")
-                    db.update_scan(scan_id, phase="selenium_login")
-                    try:
-                        from modules.selenium_auth import SeleniumAuthCapture
-                        from modules.zap_session_injector import ZapSessionInjector
-                        selenium = SeleniumAuthCapture(
-                            zap_proxy_host=os.getenv("ZAP_HOST", "zap"),
-                            zap_proxy_port=int(os.getenv("ZAP_PORT", "8080")),
-                        )
-                        session_result = await selenium.capture_session(
-                            login_url=effective_auth["login_url"],
-                            username=effective_auth.get("username"),
-                            password=effective_auth.get("password"),
-                            username_field=effective_auth.get("username_field", "username"),
-                            password_field=effective_auth.get("password_field", "password"),
-                            logged_in_indicator=effective_auth.get("logged_in_indicator"),
-                        )
-                        if session_result["success"]:
-                            logger.info(f"[{scan_id}] Selenium login OK — injecting session into ZAP")
-                            db.update_scan(scan_id, phase="zap_session_injection")
-                            injector = ZapSessionInjector(
-                                api_url=os.getenv("ZAP_API_URL", "http://localhost:8080"),
-                                api_key=os.getenv("ZAP_API_KEY", ""),
+            # Pre-flight: wait for ZAP to be ready (up to 120 s)
+            _zap_ready = False
+            for _attempt in range(24):  # 24 × 5 s = 120 s
+                if await zap_scanner.check_health():
+                    _zap_ready = True
+                    break
+                logger.info(f"[{scan_id}] Waiting for ZAP… attempt {_attempt + 1}/24")
+                db.update_scan(scan_id, phase=f"zap_starting_{_attempt + 1}")
+                await asyncio.sleep(5)
+            if not _zap_ready:
+                logger.error(f"[{scan_id}] ZAP did not become ready in 120 s — ZAP scan skipped")
+                db.update_scan(scan_id, phase="zap_timeout")
+            else:
+                try:
+                    # For form-based auth, ZAP's native form-auth is unreliable on modern apps.
+                    # Use Playwright/Selenium to do the actual login, capture the session, then
+                    # inject it into ZAP as cookie/bearer auth — same approach as the full
+                    # authenticated scan pipeline.
+                    effective_auth = auth.copy() if auth else None
+                    if effective_auth and effective_auth.get("auth_type") == "form":
+                        logger.info(f"[{scan_id}] Form auth detected — running Selenium login first…")
+                        db.update_scan(scan_id, phase="selenium_login")
+                        try:
+                            from modules.selenium_auth import SeleniumAuthCapture
+                            from modules.zap_session_injector import ZapSessionInjector
+                            selenium = SeleniumAuthCapture(
+                                zap_proxy_host=os.getenv("ZAP_HOST", "zap"),
+                                zap_proxy_port=int(os.getenv("ZAP_PORT", "8080")),
                             )
-                            await injector.inject_session(
-                                target_url=request.target,
-                                session_data=session_result,
-                                session_name=f"vulnforge-{scan_id[:8]}",
+                            session_result = await selenium.capture_session(
+                                login_url=effective_auth["login_url"],
+                                username=effective_auth.get("username"),
+                                password=effective_auth.get("password"),
+                                username_field=effective_auth.get("username_field", "username"),
+                                password_field=effective_auth.get("password_field", "password"),
+                                logged_in_indicator=effective_auth.get("logged_in_indicator"),
                             )
-                            # Persist auth screenshot if captured
-                            if session_result.get("auth_screenshot"):
-                                db.update_scan(scan_id, auth_status=json.dumps({
-                                    "verified": session_result.get("session_valid", False),
-                                    "message": session_result.get("message", ""),
-                                    "auth_screenshot": session_result["auth_screenshot"],
-                                }))
-                            # Convert to cookie auth so ZAP uses the captured session
-                            if session_result.get("cookies"):
-                                cookie_str = "; ".join(f"{k}={v}" for k, v in session_result["cookies"].items())
-                                effective_auth = dict(effective_auth)
-                                effective_auth["auth_type"] = "cookie"
-                                effective_auth["cookies"] = cookie_str
-                            elif session_result.get("token"):
-                                effective_auth = dict(effective_auth)
-                                effective_auth["auth_type"] = "bearer"
-                                effective_auth["token"] = session_result["token"]
-                        else:
-                            logger.warning(f"[{scan_id}] Selenium login failed: {session_result.get('message')} — continuing with ZAP native form auth")
-                    except Exception as se:
-                        logger.error(f"[{scan_id}] Selenium pre-auth failed: {se} — continuing with ZAP native form auth")
-                    db.update_scan(scan_id, phase="zap_scan")
+                            if session_result["success"]:
+                                logger.info(f"[{scan_id}] Selenium login OK — injecting session into ZAP")
+                                db.update_scan(scan_id, phase="zap_session_injection")
+                                injector = ZapSessionInjector(
+                                    api_url=os.getenv("ZAP_API_URL", "http://zap:8080"),
+                                    api_key=os.getenv("ZAP_API_KEY", "vulnforge-zap-key"),
+                                )
+                                await injector.inject_session(
+                                    target_url=request.target,
+                                    session_data=session_result,
+                                    session_name=f"vulnforge-{scan_id[:8]}",
+                                )
+                                # Persist auth screenshot if captured
+                                if session_result.get("auth_screenshot"):
+                                    db.update_scan(scan_id, auth_status=json.dumps({
+                                        "verified": session_result.get("session_valid", False),
+                                        "message": session_result.get("message", ""),
+                                        "auth_screenshot": session_result["auth_screenshot"],
+                                    }))
+                                # Convert to cookie auth so ZAP uses the captured session
+                                if session_result.get("cookies"):
+                                    cookie_str = "; ".join(f"{k}={v}" for k, v in session_result["cookies"].items())
+                                    effective_auth = dict(effective_auth)
+                                    effective_auth["auth_type"] = "cookie"
+                                    effective_auth["cookies"] = cookie_str
+                                elif session_result.get("token"):
+                                    effective_auth = dict(effective_auth)
+                                    effective_auth["auth_type"] = "bearer"
+                                    effective_auth["token"] = session_result["token"]
+                            else:
+                                logger.warning(f"[{scan_id}] Selenium login failed: {session_result.get('message')} — continuing with ZAP native form auth")
+                        except Exception as se:
+                            logger.error(f"[{scan_id}] Selenium pre-auth failed: {se} — continuing with ZAP native form auth")
+                        db.update_scan(scan_id, phase="zap_scan")
 
-                zap_findings = await zap_scanner.execute(
-                    target=request.target,
-                    auth_config=effective_auth,
-                    scan_type=request.scan_type,
-                    severity=request.severity_filter,
-                )
-                for f in zap_findings:
-                    f["scanner_source"] = "zap"
-                all_raw_findings.extend(zap_findings)
-                logger.info(f"[{scan_id}] ZAP: {len(zap_findings)} findings")
+                    zap_findings = await zap_scanner.execute(
+                        target=request.target,
+                        auth_config=effective_auth,
+                        scan_type=request.scan_type,
+                        severity=request.severity_filter,
+                    )
+                    for f in zap_findings:
+                        f["scanner_source"] = "zap"
+                    all_raw_findings.extend(zap_findings)
+                    logger.info(f"[{scan_id}] ZAP: {len(zap_findings)} findings")
 
-                # Persist auth verification result
-                ar = zap_scanner.last_auth_result
-                if ar:
-                    existing_as = {}
-                    try:
-                        row = db.get_scan(scan_id)
-                        existing_as = json.loads(row.get("auth_status") or "{}") if row else {}
-                    except Exception:
-                        pass
-                    db.update_scan(scan_id, auth_status=json.dumps({**existing_as, **ar}))
-                    if not ar.get("verified"):
-                        logger.warning(f"[{scan_id}] ZAP auth may have failed: {ar.get('message')}")
-            except Exception as e:
-                logger.error(f"[{scan_id}] ZAP scan failed: {e}")
-                if engine == "zap":
-                    raise
+                    # Persist auth verification result
+                    ar = zap_scanner.last_auth_result
+                    if ar:
+                        existing_as = {}
+                        try:
+                            row = db.get_scan(scan_id)
+                            existing_as = json.loads(row.get("auth_status") or "{}") if row else {}
+                        except Exception:
+                            pass
+                        db.update_scan(scan_id, auth_status=json.dumps({**existing_as, **ar}))
+                        if not ar.get("verified"):
+                            logger.warning(f"[{scan_id}] ZAP auth may have failed: {ar.get('message')}")
+                except Exception as e:
+                    logger.error(f"[{scan_id}] ZAP scan failed: {e}", exc_info=True)
+                    # Never re-raise — continue with dep/SSL findings
 
         db.update_scan(scan_id, raw_finding_count=len(all_raw_findings))
 
