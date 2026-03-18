@@ -82,7 +82,7 @@ def validate_scan_target(target: str) -> None:
 
 # ── Scan concurrency limiter ──────────────────────────────────────────────────
 _MAX_CONCURRENT_SCANS = int(os.getenv("MAX_CONCURRENT_SCANS", "5"))
-_scan_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SCANS)
+_scan_semaphore: asyncio.Semaphore  # initialised in lifespan
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -304,6 +304,8 @@ async def _scheduler_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _scan_semaphore
+    _scan_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_SCANS)
     logger.info("Starting Vulnerability scanner...")
     db.initialize()
     nuclei_ok = await nuclei_scanner.check_health()
